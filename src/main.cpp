@@ -1,0 +1,581 @@
+// main.cpp  —  Controller Passthrough with Spoof Profile Picker
+// Reads a selectable XInput slot (0–3), forwards to a ViGEm virtual controller
+// spoofed as whichever hardware identity the user picks from the menu.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#include <windows.h>
+#include <mmsystem.h>
+#include <shellapi.h>
+#include <xinput.h>
+#include <iostream>
+#include <iomanip>
+#include <conio.h>
+#include <string>
+#include <chrono>
+#include <thread>
+#include <algorithm>
+#include <mutex>
+#include <atomic>
+
+#include "vigem_loader.h"
+#include "hid_maestro_helper.h"
+#include "hidhide_cloaker.h"
+#include "ds4_hid_reader.h"
+
+#pragma comment(lib, "winmm.lib")
+#pragma comment(lib, "xinput.lib")
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  XInputGetStateEx — undocumented ordinal #100 export from xinput1_3.dll.
+//  Identical to XInputGetState but does NOT mask the guide button bit
+//  (XUSB_GAMEPAD_GUIDE / 0x0400) out of XINPUT_GAMEPAD::wButtons.
+//  We load it manually so the app still links against xinput.lib normally.
+// ─────────────────────────────────────────────────────="────────────────────
+typedef DWORD(WINAPI* PFN_XInputGetStateEx)(DWORD, XINPUT_STATE*);
+static PFN_XInputGetStateEx g_XInputGetStateEx = nullptr;
+
+static void LoadXInputGetStateEx() {
+    // xinput1_3.dll is the only version that exposes ordinal 100.
+    HMODULE hXInput = LoadLibraryA("xinput1_3.dll");
+    if (hXInput) {
+        g_XInputGetStateEx = reinterpret_cast<PFN_XInputGetStateEx>(
+            GetProcAddress(hXInput, reinterpret_cast<LPCSTR>(100))
+        );
+    }
+    // Deliberately not freeing the module — we hold the reference for the
+    // lifetime of the process so the pointer stays valid.
+}
+
+// Wrapper: use the Ex variant if available, fall back to the normal one.
+static DWORD XInputGetStateWithGuide(DWORD slot, XINPUT_STATE* state) {
+    if (g_XInputGetStateEx) return g_XInputGetStateEx(slot, state);
+    return XInputGetState(slot, state);
+}
+
+
+static bool IsRunAsAdmin() {
+    BOOL isAdmin = FALSE;
+    PSID adminGroup = NULL;
+    SID_IDENTIFIER_AUTHORITY ntAuthority = SECURITY_NT_AUTHORITY;
+    if (AllocateAndInitializeSid(&ntAuthority, 2,
+            SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS,
+            0, 0, 0, 0, 0, 0, &adminGroup)) {
+        CheckTokenMembership(NULL, adminGroup, &isAdmin);
+        FreeSid(adminGroup);
+    }
+    return isAdmin == TRUE;
+}
+
+static void ClearScreen() {
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    COORD coord = { 0, 0 };
+    DWORD count;
+    CONSOLE_SCREEN_BUFFER_INFO csbi;
+    GetConsoleScreenBufferInfo(h, &csbi);
+    FillConsoleOutputCharacter(h, ' ', csbi.dwSize.X * csbi.dwSize.Y, coord, &count);
+    SetConsoleCursorPosition(h, coord);
+}
+
+// Global runtime override for polling rate (0 = use the active profile's default).
+static std::atomic<uint32_t> g_pollOverrideHz{0};
+
+// Whether to apply HidHide controller cloaking when passthrough starts.
+static std::atomic<bool> g_hidHideEnabled{true};
+
+// XInput slot to read from (0–3).
+static std::atomic<DWORD> g_xinputSlot{0};
+
+// Busy-wait until targetTime for precise polling cadence.
+// Sleep(1)/SwitchToThread() both have unreliable wakeup latency on Windows
+// (can overshoot by a millisecond or more), so we only use them while we're
+// comfortably far from the deadline and fall back to a tight spin for the
+// last stretch — that's what actually gets jitter down near the ideal cadence.
+static void WaitUntilPrecise(std::chrono::steady_clock::time_point targetTime) {
+    while (true) {
+        auto now = std::chrono::steady_clock::now();
+        if (now >= targetTime) return;
+        auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(targetTime - now);
+        if (remaining > std::chrono::milliseconds(3)) {
+            Sleep(1);
+        } else if (remaining > std::chrono::microseconds(400)) {
+            SwitchToThread();
+        }
+        // else: tight spin, no yield — minimizes overshoot for the final <400us
+    }
+}
+
+// Prompts on stdin for a custom polling rate. Returns 0 (meaning "no change")
+// if the input is empty or not a valid number.
+static uint32_t PromptPollingRateHz() {
+    std::cout << "\n Enter polling rate in Hz (125-1000, e.g. 500), or blank to cancel: ";
+    std::string line;
+    std::getline(std::cin, line);
+    if (line.empty()) return 0;
+    try {
+        int hz = std::stoi(line);
+        if (hz < 125) hz = 125;
+        if (hz > 1000) hz = 1000;
+        return static_cast<uint32_t>(hz);
+    } catch (...) {
+        return 0;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  XInput → DS4 byte conversion  (128 = centre for DS4 axes)
+// ─────────────────────────────────────────────────────────────────────────────
+static uint8_t ConvertAxis(int16_t v) {
+    // XInput: -32768..32767  →  DS4: 0..255 (128 = centre)
+    int shifted = static_cast<int>(v) + 32768;          // 0..65535
+    return static_cast<uint8_t>(shifted * 255 / 65535);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Build reports directly from a raw XINPUT_GAMEPAD
+// ─────────────────────────────────────────────────────────────────────────────
+static void BuildX360Report(const XINPUT_GAMEPAD& gp, XUSB_REPORT& r) {
+    XUSB_REPORT_INIT(&r);
+    r.wButtons      = gp.wButtons;   // includes XUSB_GAMEPAD_GUIDE which carries
+                                      // the DS4 touchpad click when the physical
+                                      // device is a DualShock read via XInput shim
+    r.bLeftTrigger  = gp.bLeftTrigger;
+    r.bRightTrigger = gp.bRightTrigger;
+    r.sThumbLX      = gp.sThumbLX;
+    r.sThumbLY      = gp.sThumbLY;
+    r.sThumbRX      = gp.sThumbRX;
+    r.sThumbRY      = gp.sThumbRY;
+}
+
+static void BuildDS4Report(const XINPUT_GAMEPAD& gp, DS4_REPORT& r) {
+    DS4_REPORT_INIT(&r);
+
+    // Face buttons: XInput A/B/X/Y → DS4 Cross/Circle/Square/Triangle
+    if (gp.wButtons & XUSB_GAMEPAD_A)              r.wButtons |= DS4_BUTTON_CROSS;
+    if (gp.wButtons & XUSB_GAMEPAD_B)              r.wButtons |= DS4_BUTTON_CIRCLE;
+    if (gp.wButtons & XUSB_GAMEPAD_X)              r.wButtons |= DS4_BUTTON_SQUARE;
+    if (gp.wButtons & XUSB_GAMEPAD_Y)              r.wButtons |= DS4_BUTTON_TRIANGLE;
+
+    // Shoulders / triggers
+    if (gp.wButtons & XUSB_GAMEPAD_LEFT_SHOULDER)  r.wButtons |= DS4_BUTTON_SHOULDER_LEFT;
+    if (gp.wButtons & XUSB_GAMEPAD_RIGHT_SHOULDER) r.wButtons |= DS4_BUTTON_SHOULDER_RIGHT;
+    if (gp.wButtons & XUSB_GAMEPAD_LEFT_THUMB)     r.wButtons |= DS4_BUTTON_THUMB_LEFT;
+    if (gp.wButtons & XUSB_GAMEPAD_RIGHT_THUMB)    r.wButtons |= DS4_BUTTON_THUMB_RIGHT;
+
+    // Menu / view → Options / Share
+    if (gp.wButtons & XUSB_GAMEPAD_START)          r.wButtons |= DS4_BUTTON_OPTIONS;
+    if (gp.wButtons & XUSB_GAMEPAD_BACK)           r.bSpecial |= DS4_SPECIAL_BUTTON_TOUCHPAD;
+
+    // Xbox guide button → DS4 touchpad click
+    // DS4 PS button is left unmapped (no XInput equivalent for the home button)
+    // bSpecial holds the PS and touchpad bits outside of wButtons.
+    if (gp.wButtons & XUSB_GAMEPAD_GUIDE)          r.bSpecial |= DS4_SPECIAL_BUTTON_TOUCHPAD;
+
+    // D-Pad via hat value.
+    // DS4_BUTTON_DPAD_* values live in the low 4 bits of wButtons as a hat
+    // (0=N, 1=NE, … 7=NW, 8=none).  DS4_REPORT_INIT sets the nibble to
+    // DS4_BUTTON_DPAD_NONE (0x08).  Because the face/shoulder buttons above
+    // already ORed bits into wButtons we must mask the low nibble to zero
+    // before writing the hat value — otherwise e.g. CROSS (0x20) leaks into
+    // the nibble and produces a bogus hat direction.
+    bool du = (gp.wButtons & XUSB_GAMEPAD_DPAD_UP)    != 0;
+    bool dd = (gp.wButtons & XUSB_GAMEPAD_DPAD_DOWN)  != 0;
+    bool dl = (gp.wButtons & XUSB_GAMEPAD_DPAD_LEFT)  != 0;
+    bool dr = (gp.wButtons & XUSB_GAMEPAD_DPAD_RIGHT) != 0;
+
+    DS4_DPAD_DIRECTIONS hat;
+    if      (du && dr)  hat = DS4_BUTTON_DPAD_NORTHEAST;
+    else if (du && dl)  hat = DS4_BUTTON_DPAD_NORTHWEST;
+    else if (dd && dr)  hat = DS4_BUTTON_DPAD_SOUTHEAST;
+    else if (dd && dl)  hat = DS4_BUTTON_DPAD_SOUTHWEST;
+    else if (du)        hat = DS4_BUTTON_DPAD_NORTH;
+    else if (dd)        hat = DS4_BUTTON_DPAD_SOUTH;
+    else if (dr)        hat = DS4_BUTTON_DPAD_EAST;
+    else if (dl)        hat = DS4_BUTTON_DPAD_WEST;
+    else                hat = DS4_BUTTON_DPAD_NONE;
+
+    r.wButtons = (r.wButtons & ~static_cast<USHORT>(0x000Fu)) | static_cast<USHORT>(hat & 0x000Fu);
+
+    // Analog
+    r.bTriggerL = gp.bLeftTrigger;
+    r.bTriggerR = gp.bRightTrigger;
+    r.bThumbLX  = ConvertAxis(gp.sThumbLX);
+    r.bThumbLY  = 255 - ConvertAxis(gp.sThumbLY);   // DS4 Y is inverted
+    r.bThumbRX  = ConvertAxis(gp.sThumbRX);
+    r.bThumbRY  = 255 - ConvertAxis(gp.sThumbRY);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Dashboard state — the hot polling loop only writes a small POD snapshot
+//  under a mutex; all console I/O happens on a separate normal-priority
+//  thread so it can never add jitter to input forwarding.
+// ─────────────────────────────────────────────────────────────────────────────
+struct DashboardSnapshot {
+    bool hasInput = false;
+    bool lastTx = false;
+    uint64_t packets = 0;
+    uint64_t fails = 0;
+    double hz = 0.0;
+    XINPUT_GAMEPAD gamepad{};
+    // HidHide cloaking status shown in the dashboard header
+    bool  cloakApplied  = false;
+    int   cloakCount    = 0;
+    DWORD xinputSlot    = 0;
+    // Input source for display
+    const char* inputSource = "XInput";
+};
+
+static std::mutex        g_dashMutex;
+static DashboardSnapshot g_dashSnapshot;
+static std::atomic<bool> g_dashRunning{false};
+
+static void RenderDashboard(const ControllerSpoofProfile& profile, bool isDS4) {
+    DashboardSnapshot snap;
+    {
+        std::lock_guard<std::mutex> lock(g_dashMutex);
+        snap = g_dashSnapshot;
+    }
+
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    SetConsoleCursorPosition(hOut, { 0, 0 });
+
+    std::cout
+        << "======================================================================\n"
+        << "       CONTROLLER PASSTHROUGH  -  SLOT " << snap.xinputSlot << " (PHYSICAL)\n"
+        << "======================================================================\n"
+        << " Profile  : " << profile.name << "                              \n"
+        << " Identity : " << profile.productName
+        << "  VID=0x" << std::hex << std::uppercase << std::setfill('0') << std::setw(4) << profile.vendorId
+        << " PID=0x"  << std::setw(4) << profile.productId << std::dec << "  \n"
+        << " Type     : " << (isDS4 ? "DualShock 4 (DS4)" : "Xbox 360") << "                              \n"
+        << " Rate     : " << std::fixed << std::setprecision(1) << snap.hz
+        << " Hz  |  Packets: " << snap.packets << "  Failed: " << snap.fails << "              \n"
+        << " Status   : " << (snap.hasInput ? (snap.lastTx ? "[TX OK]" : "[TX ERR]") : "[WAITING FOR CONTROLLER]") << "              \n"
+        << " Input    : " << snap.inputSource << "                              \n"
+        << " Cloaking : " << (snap.cloakApplied
+                              ? ("[ACTIVE — " + std::to_string(snap.cloakCount) + " physical device(s) hidden]")
+                              : "[OFF — physical controller visible to all apps]")
+        << "              \n"
+        << "======================================================================\n\n";
+
+    if (snap.hasInput) {
+        auto& gp = snap.gamepad;
+        std::cout
+            << " Left  Stick : X=" << std::setw(6) << gp.sThumbLX << "  Y=" << std::setw(6) << gp.sThumbLY << "              \n"
+            << " Right Stick : X=" << std::setw(6) << gp.sThumbRX << "  Y=" << std::setw(6) << gp.sThumbRY << "              \n"
+            << " Triggers    : L=" << std::setw(3) << (int)gp.bLeftTrigger << "  R=" << std::setw(3) << (int)gp.bRightTrigger << "              \n"
+            << " Buttons     :"
+            << (gp.wButtons & XUSB_GAMEPAD_A              ? " A"  : "  ")
+            << (gp.wButtons & XUSB_GAMEPAD_B              ? " B"  : "  ")
+            << (gp.wButtons & XUSB_GAMEPAD_X              ? " X"  : "  ")
+            << (gp.wButtons & XUSB_GAMEPAD_Y              ? " Y"  : "  ")
+            << (gp.wButtons & XUSB_GAMEPAD_LEFT_SHOULDER  ? " LB" : "   ")
+            << (gp.wButtons & XUSB_GAMEPAD_RIGHT_SHOULDER ? " RB" : "   ")
+            << (gp.wButtons & XUSB_GAMEPAD_START          ? " ST" : "   ")
+            << (gp.wButtons & XUSB_GAMEPAD_BACK           ? " BK" : "   ")
+            << "              \n"
+            << " D-Pad       :"
+            << (gp.wButtons & XUSB_GAMEPAD_DPAD_UP    ? " U" : "  ")
+            << (gp.wButtons & XUSB_GAMEPAD_DPAD_DOWN  ? " D" : "  ")
+            << (gp.wButtons & XUSB_GAMEPAD_DPAD_LEFT  ? " L" : "  ")
+            << (gp.wButtons & XUSB_GAMEPAD_DPAD_RIGHT ? " R" : "  ")
+            << "                                                    \n\n";
+    } else {
+        std::cout << " [No controller detected — plug in your controller\n"
+                  << "  (HID path: scanning all gamepads; XInput slot " << snap.xinputSlot << " also monitored)]\n\n";
+    }
+
+    std::cout << " Press [ESC] or [Q] to stop and return to menu\n";
+}
+
+static void DashboardThreadFunc(const ControllerSpoofProfile* profile, bool isDS4) {
+    while (g_dashRunning.load(std::memory_order_relaxed)) {
+        RenderDashboard(*profile, isDS4);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Passthrough loop
+// ─────────────────────────────────────────────────────────────────────────────
+static void RunPassthrough(ViGEmLoader& vigem, const ControllerSpoofProfile& profile) {
+    bool isDS4 = (profile.virtualTarget == MaestroVirtualTarget::DualShock4);
+    VIGEM_TARGET_TYPE vtype = isDS4 ? DualShock4Wired : Xbox360Wired;
+
+    // ── HidHide cloaking ─────────────────────────────────────────────────
+    // Apply before creating the virtual target so the physical controller
+    // is already hidden by the time games enumerate devices.
+    HidHideCloaker cloaker;
+    HidHideCloaker::CloakResult cloakResult;
+    if (g_hidHideEnabled.load()) {
+        cloakResult = cloaker.Apply();
+        if (!cloakResult.hidhideAvailable) {
+            std::cout << "\n [HidHide] " << cloakResult.statusMessage << "\n"
+                      << " Continuing without cloaking — press any key...\n";
+            _getch();
+        } else {
+            std::cout << "\n [HidHide] " << cloakResult.statusMessage << "\n";
+        }
+    }
+
+    ViGEmTargetImpl* target = vigem.CreateTarget(vtype, profile.vendorId, profile.productId);
+    if (!target || !vigem.AddTarget(target)) {
+        std::cout << "\n [ERROR] Could not create virtual controller: "
+                  << vigem.GetLastErrorText() << "\n"
+                  << " Make sure ViGEmBus is installed (run setup_drivers.bat as Admin).\n"
+                  << " Press any key to return...\n";
+        if (target) vigem.RemoveTarget(target);
+        // cloaker destructor restores HidHide state automatically
+        _getch();
+        return;
+    }
+
+    // Raise timer resolution and both process + thread priority for the
+    // tightest possible polling cadence. REALTIME_PRIORITY_CLASS + TIME_CRITICAL
+    // is a meaningful step up from HIGHEST; it's safe here because the loop
+    // spends nearly all its time blocked in XInputGetState or WaitUntilPrecise
+    // rather than burning CPU, so it won't meaningfully starve the rest of the system.
+    timeBeginPeriod(1);
+    int oldPrio = GetThreadPriority(GetCurrentThread());
+    DWORD oldPriorityClass = GetPriorityClass(GetCurrentProcess());
+    SetPriorityClass(GetCurrentProcess(), REALTIME_PRIORITY_CLASS);
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+
+    uint32_t configuredHz = g_pollOverrideHz.load() != 0 ? g_pollOverrideHz.load() : profile.pollingRateHz;
+    uint32_t targetHz = std::max(125u, std::min(1000u, configuredHz));
+    auto pollInterval = std::chrono::nanoseconds(1000000000ull / targetHz);
+    auto nextPoll     = std::chrono::steady_clock::now();
+
+    uint64_t polls = 0, packets = 0, fails = 0;
+    auto startTime = std::chrono::steady_clock::now();
+
+    XUSB_REPORT xOut;   XUSB_REPORT_INIT(&xOut);
+    DS4_REPORT  ds4Out; DS4_REPORT_INIT(&ds4Out);
+    XINPUT_STATE xState;
+    bool lastTx = false;
+
+    // Try to open the physical controller as a raw HID device first.
+    // This now detects ANY HID gamepad/joystick (not just Sony devices),
+    // including controllers that are hidden by HidHide but accessible because
+    // this process is whitelisted.  Falls back to XInput if nothing found.
+    DS4HidReader hidReader;
+    bool useRawHid = hidReader.Open();
+    const char* inputSource = useRawHid
+        ? hidReader.DeviceName()
+        : "XInput (no HID gamepad found)";
+
+    ClearScreen();
+
+    // Rendering happens on its own normal-priority thread so console I/O
+    // never blocks — or adds jitter to — the time-critical polling loop below.
+    g_dashRunning.store(true);
+    std::thread dashThread(DashboardThreadFunc, &profile, isDS4);
+
+    while (true) {
+        // ESC or Q → quit
+        if (_kbhit()) {
+            char k = _getch();
+            if (k == 27 || k == 'q' || k == 'Q') break;
+        }
+
+        // Poll physical controller — raw HID path for DS4/DualSense,
+        // XInput path for everything else.
+        bool hasInput = false;
+        PhysicalGamepadState hidState;
+
+        if (useRawHid) {
+            hasInput = hidReader.Read(hidState);
+            if (!hasInput && !hidReader.IsOpen()) {
+                // Device was disconnected — try to reopen next tick.
+                // Open() scans all HID gamepads again, so a different
+                // controller plugged in will be picked up automatically.
+                useRawHid = hidReader.Open();
+                inputSource = useRawHid ? hidReader.DeviceName() : "XInput (no HID gamepad found)";
+            }
+        }
+
+        if (!useRawHid) {
+            ZeroMemory(&xState, sizeof(xState));
+            hasInput = (XInputGetStateWithGuide(g_xinputSlot.load(), &xState) == ERROR_SUCCESS);
+        }
+        polls++;
+
+        lastTx = false;
+        if (hasInput) {
+            // Unify into an XINPUT_GAMEPAD-shaped struct for the existing builders.
+            XINPUT_GAMEPAD gp{};
+            if (useRawHid) {
+                gp.sThumbLX      = hidState.leftX;
+                gp.sThumbLY      = hidState.leftY;
+                gp.sThumbRX      = hidState.rightX;
+                gp.sThumbRY      = hidState.rightY;
+                gp.bLeftTrigger  = hidState.leftTrigger;
+                gp.bRightTrigger = hidState.rightTrigger;
+                gp.wButtons      = hidState.buttons;
+                // Touchpad click → treat as BACK so BuildDS4Report maps it to
+                // DS4_SPECIAL_BUTTON_TOUCHPAD via the existing XUSB_GAMEPAD_BACK path.
+                if (hidState.touchpad) gp.wButtons |= XUSB_GAMEPAD_BACK;
+                // PS button → guide
+                if (hidState.psButton) gp.wButtons |= XUSB_GAMEPAD_GUIDE;
+            } else {
+                gp = xState.Gamepad;
+            }
+
+            if (isDS4) {
+                BuildDS4Report(gp, ds4Out);
+                lastTx = vigem.UpdateDS4(target, ds4Out);
+            } else {
+                BuildX360Report(gp, xOut);
+                lastTx = vigem.UpdateX360(target, xOut);
+            }
+            packets++;
+            if (!lastTx) fails++;
+
+            // Mirror into snapshot for dashboard (always an XINPUT_GAMEPAD shape now).
+            xState.Gamepad = gp;
+        }
+
+        // Publish a snapshot for the dashboard thread. This is just an
+        // uncontended mutex lock + POD copy (no I/O), so it costs on the
+        // order of tens of nanoseconds instead of the hundreds of
+        // microseconds console output used to cost on this hot path.
+        {
+            auto now = std::chrono::steady_clock::now();
+            double elapsed = std::chrono::duration<double>(now - startTime).count();
+            std::lock_guard<std::mutex> lock(g_dashMutex);
+            g_dashSnapshot.hasInput     = hasInput;
+            g_dashSnapshot.lastTx       = lastTx;
+            g_dashSnapshot.packets      = packets;
+            g_dashSnapshot.fails        = fails;
+            g_dashSnapshot.hz           = elapsed > 0 ? packets / elapsed : 0.0;
+            g_dashSnapshot.cloakApplied = cloaker.IsApplied();
+            g_dashSnapshot.cloakCount   = cloakResult.devicesCloaked;
+            g_dashSnapshot.xinputSlot   = g_xinputSlot.load();
+            g_dashSnapshot.inputSource  = inputSource;
+            if (hasInput) g_dashSnapshot.gamepad = xState.Gamepad;
+        }
+
+        nextPoll += pollInterval;
+        if (nextPoll <= std::chrono::steady_clock::now())
+            nextPoll = std::chrono::steady_clock::now() + pollInterval;
+        WaitUntilPrecise(nextPoll);
+    }
+
+    g_dashRunning.store(false);
+    dashThread.join();
+
+    SetThreadPriority(GetCurrentThread(), oldPrio);
+    SetPriorityClass(GetCurrentProcess(), oldPriorityClass);
+    timeEndPeriod(1);
+    vigem.RemoveTarget(target);
+
+    ClearScreen();
+    std::cout << "\n Passthrough stopped. Press any key...\n";
+    _getch();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Menu
+// ─────────────────────────────────────────────────────────────────────────────
+int main() {
+    // Set both input and output codepages to UTF-8 so that Unicode characters
+    // (em-dashes, box-drawing chars, etc.) render correctly instead of
+    // appearing as garbage like "ΓÇö" (Windows-1252 misread of U+2014).
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+
+    SetConsoleTitleA("Controller Passthrough — Spoof Profile Picker");
+    LoadXInputGetStateEx();
+
+    // Auto-elevate if not admin
+    if (!IsRunAsAdmin()) {
+        char path[MAX_PATH];
+        GetModuleFileNameA(NULL, path, MAX_PATH);
+        SHELLEXECUTEINFOA sei = { sizeof(sei) };
+        sei.lpVerb = "runas";
+        sei.lpFile = path;
+        sei.nShow  = SW_NORMAL;
+        if (ShellExecuteExA(&sei)) return 0;
+        // If elevation was declined just continue in user mode
+    }
+
+    ViGEmLoader      vigem;
+    HIDMaestroHelper maestro;
+
+    bool running = true;
+    while (running) {
+        ClearScreen();
+
+        const auto& profiles = maestro.GetProfiles();
+        size_t      sel      = maestro.GetSelectedIndex();
+
+        std::cout
+            << "======================================================================\n"
+            << "         CONTROLLER PASSTHROUGH  —  SPOOF PROFILE PICKER\n"
+            << "======================================================================\n"
+            << " ViGEmBus : " << (vigem.isLoaded ? "[ONLINE]" : "[OFFLINE — run setup_drivers.bat]") << "              \n"
+            << "======================================================================\n\n"
+            << " Choose a controller to spoof (virtual device appears on slot 0):\n\n";
+
+        for (size_t i = 0; i < profiles.size(); i++) {
+            const auto& p = profiles[i];
+            std::cout
+                << " [" << (i + 1) << "] "
+                << (i == sel ? "* " : "  ")
+                << p.name
+                << "  (VID=0x" << std::hex << std::uppercase << std::setfill('0') << std::setw(4) << p.vendorId
+                << " PID=0x"   << std::setw(4) << p.productId << std::dec
+                << ", default " << p.pollingRateHz << " Hz)\n";
+        }
+
+        // Show which XInput slots currently have a controller connected.
+        // Use the same XInputGetStateWithGuide wrapper as the passthrough loop
+        // so results are consistent.  Mark the active slot with an arrow.
+        uint32_t effectiveHz = g_pollOverrideHz.load() != 0 ? g_pollOverrideHz.load() : profiles[sel].pollingRateHz;
+        DWORD activeSlot = g_xinputSlot.load();
+        std::cout << "\n [S] Start  [R] Polling Rate  [C] XInput Slot  [H] HidHide  [0] Exit\n\n"
+                  << " Active        : " << profiles[sel].name << "\n"
+                  << " Polling Rate  : " << effectiveHz << " Hz"
+                  << (g_pollOverrideHz.load() != 0 ? "  (manual override)" : "  (profile default)") << "\n"
+                  << " XInput Slot   :\n";
+        for (DWORD i = 0; i < 4; i++) {
+            XINPUT_STATE xs{};
+            bool connected = (XInputGetStateWithGuide(i, &xs) == ERROR_SUCCESS);
+            std::cout << (i == activeSlot ? "   --> " : "       ")
+                      << "Slot " << i << " : " << (connected ? "[CONNECTED]" : "[no controller]") << "\n";
+        }
+        std::cout
+            << " HidHide Cloak : " << (g_hidHideEnabled.load() ? "[ENABLED]  — physical controller will be hidden from games" : "[DISABLED] — physical controller will remain visible") << "\n"
+            << "======================================================================\n"
+            << " Enter choice: ";
+
+        char c = _getch();
+        std::cout << c << "\n";
+
+        if (c == '0') {
+            running = false;
+        } else if (c == 's' || c == 'S') {
+            if (!vigem.isLoaded) {
+                std::cout << "\n [ERROR] ViGEmBus not available. Run setup_drivers.bat first.\n"
+                          << " Press any key...\n";
+                _getch();
+            } else {
+                RunPassthrough(vigem, maestro.GetActiveProfile());
+            }
+        } else if (c == 'r' || c == 'R') {
+            uint32_t hz = PromptPollingRateHz();
+            if (hz != 0) g_pollOverrideHz.store(hz);
+        } else if (c == 'c' || c == 'C') {
+            g_xinputSlot.store((g_xinputSlot.load() + 1) % 4);
+        } else if (c == 'h' || c == 'H') {
+            g_hidHideEnabled.store(!g_hidHideEnabled.load());
+        } else {
+            int idx = c - '1';
+            if (idx >= 0 && idx < (int)profiles.size()) {
+                maestro.SetSelectedIndex((size_t)idx);
+            }
+        }
+    }
+
+    std::cout << "\n Goodbye!\n";
+    return 0;
+}
