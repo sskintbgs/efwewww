@@ -1,13 +1,27 @@
 # Controller Passthrough (Spoof Profile Picker)
 
-A Windows console utility that reads a physical game controller and forwards its
-input to a **ViGEm** virtual controller, presenting itself under a selectable
-hardware identity (Xbox 360, DualShock 4, DualSense, Switch Pro, GameSir, or a
-custom VID/PID). Optionally it uses **HidHide** to hide the physical controller
-from other applications so only the virtual device is visible.
+A Windows utility that reads a physical game controller and forwards its input
+to a **ViGEm** virtual controller, presenting itself under a selectable hardware
+identity (Xbox 360, DualShock 4, DualSense, Switch Pro, GameSir, or a custom
+VID/PID). Optionally it uses **HidHide** to hide the physical controller from
+other applications so only the virtual device is visible.
 
-This is the same building-block stack used by tools such as DS4Windows/reWASD
-(ViGEmBus for the virtual pad, HidHide for cloaking, raw HID for reading).
+It ships with a **modern dark dashboard GUI** (Dear ImGui + Direct3D 11) as the
+primary front-end, plus the original console front-end. This is the same
+building-block stack used by tools such as DS4Windows/reWASD (ViGEmBus for the
+virtual pad, HidHide for cloaking, raw HID for reading).
+
+## Interface
+
+A clean, real-time dashboard: left nav rail, live status pills, a Start/Stop
+control, selectable spoof-profile cards and a live controller visualisation.
+
+| Dashboard | Profiles | Settings |
+|---|---|---|
+| ![Dashboard](docs/screenshots/dashboard.png) | ![Profiles](docs/screenshots/profiles.png) | ![Settings](docs/screenshots/settings.png) |
+
+(Screenshots captured from the actual build; `ViGEmBus OFFLINE` simply reflects
+the driver not being installed in the capture environment.)
 
 ## What it does
 
@@ -34,18 +48,23 @@ The [ViGEmClient](https://github.com/nefarius/ViGEmClient) source is vendored
 under `third_party/ViGEmClient`, so no external package fetch is needed.
 
 Simplest option — double-click or run `build.bat` (finds MSVC via `vcvars64.bat`,
-compiles ViGEmClient + the app, and produces `ControllerPassthrough.exe`):
+compiles ViGEmClient + Dear ImGui + both front-ends). It produces
+`ControllerPassthroughGui.exe` (the GUI) and `ControllerPassthrough.exe` (CLI):
 
 ```bat
 build.bat
 ```
 
-Or with CMake:
+Or with CMake (builds `controller_passthrough_gui`, `controller_passthrough`
+and the `parse_tests` target):
 
 ```bat
 cmake -S . -B build
 cmake --build build --config Release
 ```
+
+Dear ImGui is vendored under `third_party/imgui`; the GUI uses the Win32 +
+Direct3D 11 backends.
 
 This produces `controller_passthrough.exe` and the `parse_tests` test binary.
 (You can also build `src/main.cpp` directly in an MSVC project; the headers pull

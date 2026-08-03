@@ -40,49 +40,50 @@ exit /b 1
 echo [OK] Compiler ready.
 echo.
 
-:: ── Step 1: Compile ViGEmClient.cpp ───────────────────────────────────────
-echo [1/2] Compiling ViGEmClient...
+set COMMON_INC=/I"." /I"src" /I"third_party\ViGEmClient\include" /I"third_party\ViGEmClient\include\ViGEm" /I"third_party\ViGEmClient\src"
+set IMGUI_INC=/I"third_party\imgui" /I"third_party\imgui\backends"
+set SYSLIBS=xinput.lib winmm.lib user32.lib shell32.lib advapi32.lib setupapi.lib hid.lib cfgmgr32.lib ole32.lib
 
+:: ── Step 1: ViGEmClient ────────────────────────────────────────────────────
+echo [1/4] Compiling ViGEmClient...
 cl.exe /nologo /std:c++17 /EHsc /O2 /W1 /MT /DNOMINMAX /c ^
-    /I"third_party\ViGEmClient\include" ^
-    /I"third_party\ViGEmClient\include\ViGEm" ^
-    /I"third_party\ViGEmClient\src" ^
-    third_party\ViGEmClient\src\ViGEmClient.cpp ^
-    /Fo"ViGEmClient.obj"
-
+    /I"third_party\ViGEmClient\include" /I"third_party\ViGEmClient\include\ViGEm" /I"third_party\ViGEmClient\src" ^
+    third_party\ViGEmClient\src\ViGEmClient.cpp /Fo"ViGEmClient.obj"
 if errorlevel 1 goto BUILD_FAIL
 
-:: ── Step 2: Compile and link main.cpp ─────────────────────────────────────
-:: Sources live in src\.  The repo root (".") must be on the include path
-:: because vigem_loader.h includes the vendored header via a repo-root-relative
-:: path ("third_party\ViGEmClient\include\ViGEm\Client.h").
-echo [2/2] Compiling main.cpp...
+:: ── Step 2: Dear ImGui (core + Win32/DX11 backends) ────────────────────────
+echo [2/4] Compiling Dear ImGui...
+cl.exe /nologo /std:c++17 /EHsc /O2 /W1 /MT /DNOMINMAX /c %IMGUI_INC% ^
+    third_party\imgui\imgui.cpp ^
+    third_party\imgui\imgui_draw.cpp ^
+    third_party\imgui\imgui_tables.cpp ^
+    third_party\imgui\imgui_widgets.cpp ^
+    third_party\imgui\backends\imgui_impl_win32.cpp ^
+    third_party\imgui\backends\imgui_impl_dx11.cpp
+if errorlevel 1 goto BUILD_FAIL
 
+:: ── Step 3: GUI front-end (primary) ────────────────────────────────────────
+echo [3/4] Compiling GUI (ControllerPassthroughGui.exe)...
+cl.exe /nologo /std:c++17 /EHsc /O2 /W3 /MT /DNOMINMAX /DUNICODE /D_UNICODE ^
+    %COMMON_INC% %IMGUI_INC% ^
+    src\gui_main.cpp ^
+    ViGEmClient.obj imgui.obj imgui_draw.obj imgui_tables.obj imgui_widgets.obj imgui_impl_win32.obj imgui_impl_dx11.obj ^
+    /Fe:ControllerPassthroughGui.exe ^
+    /link %SYSLIBS% d3d11.lib dxgi.lib d3dcompiler.lib dwmapi.lib gdi32.lib /SUBSYSTEM:WINDOWS
+if errorlevel 1 goto BUILD_FAIL
+
+:: ── Step 4: CLI front-end ──────────────────────────────────────────────────
+echo [4/4] Compiling CLI (ControllerPassthrough.exe)...
 cl.exe /nologo /std:c++17 /EHsc /O2 /W3 /MT /DNOMINMAX ^
-    /I"." ^
-    /I"src" ^
-    /I"third_party\ViGEmClient\include" ^
-    /I"third_party\ViGEmClient\include\ViGEm" ^
-    /I"third_party\ViGEmClient\src" ^
-    src\main.cpp ^
-    ViGEmClient.obj ^
+    %COMMON_INC% ^
+    src\main.cpp ViGEmClient.obj ^
     /Fe:ControllerPassthrough.exe ^
-    /link ^
-    xinput.lib ^
-    winmm.lib ^
-    user32.lib ^
-    shell32.lib ^
-    advapi32.lib ^
-    setupapi.lib ^
-    hid.lib ^
-    cfgmgr32.lib ^
-    /SUBSYSTEM:CONSOLE
-
+    /link %SYSLIBS% /SUBSYSTEM:CONSOLE
 if errorlevel 1 goto BUILD_FAIL
 
 echo.
 echo ======================================================================
-echo [SUCCESS] ControllerPassthrough.exe built successfully.
+echo [SUCCESS] Built ControllerPassthroughGui.exe (GUI) and ControllerPassthrough.exe (CLI).
 echo ======================================================================
 echo.
 pause

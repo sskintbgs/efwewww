@@ -28,3 +28,22 @@ cannot run on the Linux cloud VM, but you can still get real signal:
   DS4 and DualSense do **not** share the same USB byte layout.
 - The `#pragma comment(lib, ...)` / cast-function-type / missing-field-initializer
   warnings from MinGW are expected (MSVC-specific pragmas etc.) and are not errors.
+
+### GUI front-end (Dear ImGui + Direct3D 11)
+
+- `src/gui_main.cpp` is the modern dashboard; it drives `PassthroughEngine`
+  (`src/passthrough_engine.h`), the headless worker-thread forwarding loop that
+  publishes a thread-safe `EngineLiveState`. The CLI (`src/main.cpp`) is the
+  legacy front-end. Shared pure logic stays in `report_builders.h` /
+  `ds4_hid_reader.h` (still the unit-tested part).
+- Dear ImGui is vendored under `third_party/imgui`. `scripts/run_tests.sh`
+  compile-checks both `main.cpp` and `gui_main.cpp` under MinGW.
+- The full app + GUI now **link** under MinGW too, because the HID headers are
+  wrapped in `extern "C"` (`ds4_hid_reader.h` / `hidhide_cloaker.h`) — MinGW's
+  `hidsdi.h`/`hidpi.h` lack it, unlike the MSVC SDK.
+- To actually *see* the GUI headlessly on the Linux VM (no GPU): cross-link the
+  GUI exe, then run it under Wine on an Xvfb display with software GL, e.g.
+  `Xvfb :99 & DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe wine ControllerPassthroughGui.exe`,
+  and screenshot with `DISPLAY=:99 scrot out.png` (use `xdotool` to click nav).
+  `ViGEmBus` shows OFFLINE under Wine and Start is disabled (no driver), so the
+  live-controller visualisation only populates on real Windows + ViGEmBus + a pad.

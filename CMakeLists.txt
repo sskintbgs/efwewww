@@ -20,11 +20,33 @@ set(PASSTHROUGH_INCLUDES
 # via #pragma comment(lib, ...); listing them here keeps other toolchains happy.
 set(PASSTHROUGH_SYS_LIBS setupapi hid cfgmgr32 winmm xinput)
 
-# ── Application (Windows only) ────────────────────────────────────────────────
+# ── Applications (Windows only) ───────────────────────────────────────────────
 if(WIN32)
+    # CLI front-end.
     add_executable(controller_passthrough src/main.cpp)
     target_include_directories(controller_passthrough PRIVATE ${PASSTHROUGH_INCLUDES})
     target_link_libraries(controller_passthrough PRIVATE ViGEmClient ${PASSTHROUGH_SYS_LIBS})
+
+    # Dear ImGui (core + Win32/DX11 backends) built as a static library.
+    add_library(imgui STATIC
+        third_party/imgui/imgui.cpp
+        third_party/imgui/imgui_draw.cpp
+        third_party/imgui/imgui_tables.cpp
+        third_party/imgui/imgui_widgets.cpp
+        third_party/imgui/backends/imgui_impl_win32.cpp
+        third_party/imgui/backends/imgui_impl_dx11.cpp)
+    target_include_directories(imgui PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui/backends)
+
+    # Modern GUI front-end (windowed).
+    add_executable(controller_passthrough_gui WIN32 src/gui_main.cpp)
+    target_compile_definitions(controller_passthrough_gui PRIVATE UNICODE _UNICODE)
+    target_include_directories(controller_passthrough_gui PRIVATE ${PASSTHROUGH_INCLUDES})
+    target_link_libraries(controller_passthrough_gui PRIVATE
+        imgui ViGEmClient
+        d3d11 dxgi d3dcompiler dwmapi gdi32
+        ${PASSTHROUGH_SYS_LIBS})
 endif()
 
 # ── Unit tests for the pure parsing / conversion logic ───────────────────────

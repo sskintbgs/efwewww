@@ -15,8 +15,14 @@ CXX=x86_64-w64-mingw32-g++
 INCLUDES=(-I"$ROOT" -I"$ROOT/src" -I"$ROOT/third_party/ViGEmClient/include")
 OUT="$(mktemp -d)"
 
-echo "==> Compile-checking application (src/main.cpp)"
+echo "==> Compile-checking CLI application (src/main.cpp)"
 "$CXX" -std=c++17 "${INCLUDES[@]}" -c "$ROOT/src/main.cpp" -o "$OUT/main.o"
+echo "    OK"
+
+echo "==> Compile-checking GUI application (src/gui_main.cpp)"
+"$CXX" -std=c++17 -DUNICODE -D_UNICODE "${INCLUDES[@]}" \
+    -I"$ROOT/third_party/imgui" -I"$ROOT/third_party/imgui/backends" \
+    -c "$ROOT/src/gui_main.cpp" -o "$OUT/gui_main.o"
 echo "    OK"
 
 echo "==> Building unit tests"
