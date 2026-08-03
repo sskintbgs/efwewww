@@ -126,6 +126,8 @@ struct AppState {
     int  pollHz  = 1000;
     int  xslot   = 0;
     bool hidHide = true;
+    std::vector<std::string> detected;   // physical controllers found while idle
+    double lastScan = -1000.0;
 };
 
 static bool BeginCard(const char* id, ImVec2 size) {
@@ -206,7 +208,8 @@ static void DrawHeader(AppState& app, ViGEmLoader& vigem, HIDMaestroHelper& maes
     ImGui::PopStyleColor(4);
 }
 
-static void DrawDashboard(HIDMaestroHelper& maestro, const EngineLiveState& s, bool running) {
+static void DrawDashboard(HIDMaestroHelper& maestro, const EngineLiveState& s, bool running,
+                          const std::vector<std::string>& detected) {
     const auto& prof = maestro.GetActiveProfile();
 
     // ── Stat cards row ────────────────────────────────────────────────────────
@@ -260,7 +263,23 @@ static void DrawDashboard(HIDMaestroHelper& maestro, const EngineLiveState& s, b
     ImGui::Separator();
 
     if (!running) {
-        ImGui::Dummy(ImVec2(0, 20));
+        ImGui::Dummy(ImVec2(0, 8));
+        ImGui::PushStyleColor(ImGuiCol_Text, theme::v4(theme::TEXT_MUTED));
+        ImGui::TextUnformatted("  Detected physical controllers:");
+        ImGui::PopStyleColor();
+        if (detected.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, theme::v4(theme::WARN_AMBER));
+            ImGui::TextUnformatted("     none detected - connect a controller (a DualSense/DualSense Edge");
+            ImGui::TextUnformatted("     may need a button press to wake, or re-pair over Bluetooth)");
+            ImGui::PopStyleColor();
+        } else {
+            for (const auto& d : detected) {
+                ImGui::PushStyleColor(ImGuiCol_Text, theme::v4(theme::ACCENT));
+                ImGui::Text("     - %s", d.c_str());
+                ImGui::PopStyleColor();
+            }
+        }
+        ImGui::Dummy(ImVec2(0, 8));
         ImGui::PushStyleColor(ImGuiCol_Text, theme::v4(theme::TEXT_MUTED));
         ImGui::TextUnformatted("  Press Start to begin forwarding and watch inputs here.");
         ImGui::PopStyleColor();
@@ -442,6 +461,17 @@ static void RenderFrame(AppState& app, ViGEmLoader& vigem, HIDMaestroHelper& mae
     const EngineLiveState s = engine.Snapshot();
     const bool running = engine.IsRunning();
 
+    // While idle, refresh the detected-controller list about once a second so
+    // the user can confirm their pad is seen before pressing Start.  (Skip while
+    // running: the device may be intentionally cloaked and thus not enumerable.)
+    if (!running) {
+        double now = ImGui::GetTime();
+        if (now - app.lastScan > 1.0) {
+            app.detected = DS4HidReader::ListDetectedControllers();
+            app.lastScan = now;
+        }
+    }
+
     const ImGuiViewport* vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(vp->WorkPos);
     ImGui::SetNextWindowSize(vp->WorkSize);
@@ -462,10 +492,15 @@ static void RenderFrame(AppState& app, ViGEmLoader& vigem, HIDMaestroHelper& mae
         ImGui::TextWrapped("%s", s.errorMessage);
         ImGui::PopStyleColor();
     }
+    if (running && s.cloakMessage[0]) {
+        ImGui::PushStyleColor(ImGuiCol_Text, theme::v4(theme::TEXT_MUTED));
+        ImGui::TextWrapped("%s", s.cloakMessage);
+        ImGui::PopStyleColor();
+    }
     ImGui::Dummy(ImVec2(0, 8));
 
     switch (app.view) {
-        case 0: DrawDashboard(maestro, s, running); break;
+        case 0: DrawDashboard(maestro, s, running, app.detected); break;
         case 1: DrawProfiles(maestro, running);     break;
         case 2: DrawSettings(app, vigem, engine, running); break;
     }

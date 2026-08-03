@@ -41,6 +41,7 @@ extern "C" {
 #include <setupapi.h>
 #include <devguid.h>
 #include <cstdint>
+#include <cstdio>
 #include <string>
 #include <vector>
 #include <algorithm>
@@ -365,6 +366,21 @@ public:
 
         s.valid = true;
         return true;
+    }
+
+    // Human-readable names of the HID gamepads/joysticks currently detected,
+    // for display in a UI.  Does not open a device for input.  A controller that
+    // is actively cloaked by HidHide and not accessible to this process may not
+    // appear (HidHide blocks the attribute-query CreateFile too).
+    static std::vector<std::string> ListDetectedControllers() {
+        std::vector<std::string> out;
+        for (const auto& c : EnumerateCandidates()) {
+            char line[192];
+            std::snprintf(line, sizeof(line), "%s  (VID 0x%04X  PID 0x%04X)",
+                          c.friendlyName, c.vid, c.pid);
+            out.emplace_back(line);
+        }
+        return out;
     }
 
 private:
