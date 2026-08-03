@@ -33,6 +33,15 @@ This is the same building-block stack used by tools such as DS4Windows/reWASD
 The [ViGEmClient](https://github.com/nefarius/ViGEmClient) source is vendored
 under `third_party/ViGEmClient`, so no external package fetch is needed.
 
+Simplest option — double-click or run `build.bat` (finds MSVC via `vcvars64.bat`,
+compiles ViGEmClient + the app, and produces `ControllerPassthrough.exe`):
+
+```bat
+build.bat
+```
+
+Or with CMake:
+
 ```bat
 cmake -S . -B build
 cmake --build build --config Release
