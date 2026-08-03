@@ -15,7 +15,12 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <cfgmgr32.h>
+// C linkage for the HID API (no-op on the MSVC SDK, required for MinGW-w64 so
+// the HidD_*/HidP_* symbols aren't C++-mangled and left unresolved).
+extern "C" {
 #include <hidsdi.h>       // HidD_GetAttributes, HidD_GetProductString
+#include <hidpi.h>        // HidP_GetCaps
+}
 #include <setupapi.h>
 #include <devguid.h>
 

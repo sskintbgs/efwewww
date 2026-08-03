@@ -30,8 +30,14 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+// The HID API headers must be given C linkage.  The Windows SDK wraps them in
+// extern "C" internally (so this is a no-op there), but MinGW-w64's copies do
+// not, which otherwise leaves the HidD_*/HidP_* symbols C++-mangled and
+// unresolved at link time.
+extern "C" {
 #include <hidsdi.h>
 #include <hidpi.h>
+}
 #include <setupapi.h>
 #include <devguid.h>
 #include <cstdint>
