@@ -21,6 +21,7 @@
 #include "hid_maestro_helper.h"
 #include "hidhide_cloaker.h"
 #include "ds4_hid_reader.h"
+#include "report_builders.h"   // ConvertAxis / BuildX360Report / BuildDS4Report
 
 #pragma comment(lib, "winmm.lib")
 #pragma comment(lib, "xinput.lib")
@@ -30,7 +31,7 @@
 //  Identical to XInputGetState but does NOT mask the guide button bit
 //  (XUSB_GAMEPAD_GUIDE / 0x0400) out of XINPUT_GAMEPAD::wButtons.
 //  We load it manually so the app still links against xinput.lib normally.
-// ─────────────────────────────────────────────────────="────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 typedef DWORD(WINAPI* PFN_XInputGetStateEx)(DWORD, XINPUT_STATE*);
 static PFN_XInputGetStateEx g_XInputGetStateEx = nullptr;
 
@@ -121,88 +122,8 @@ static uint32_t PromptPollingRateHz() {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  XInput → DS4 byte conversion  (128 = centre for DS4 axes)
-// ─────────────────────────────────────────────────────────────────────────────
-static uint8_t ConvertAxis(int16_t v) {
-    // XInput: -32768..32767  →  DS4: 0..255 (128 = centre)
-    int shifted = static_cast<int>(v) + 32768;          // 0..65535
-    return static_cast<uint8_t>(shifted * 255 / 65535);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  Build reports directly from a raw XINPUT_GAMEPAD
-// ─────────────────────────────────────────────────────────────────────────────
-static void BuildX360Report(const XINPUT_GAMEPAD& gp, XUSB_REPORT& r) {
-    XUSB_REPORT_INIT(&r);
-    r.wButtons      = gp.wButtons;   // includes XUSB_GAMEPAD_GUIDE which carries
-                                      // the DS4 touchpad click when the physical
-                                      // device is a DualShock read via XInput shim
-    r.bLeftTrigger  = gp.bLeftTrigger;
-    r.bRightTrigger = gp.bRightTrigger;
-    r.sThumbLX      = gp.sThumbLX;
-    r.sThumbLY      = gp.sThumbLY;
-    r.sThumbRX      = gp.sThumbRX;
-    r.sThumbRY      = gp.sThumbRY;
-}
-
-static void BuildDS4Report(const XINPUT_GAMEPAD& gp, DS4_REPORT& r) {
-    DS4_REPORT_INIT(&r);
-
-    // Face buttons: XInput A/B/X/Y → DS4 Cross/Circle/Square/Triangle
-    if (gp.wButtons & XUSB_GAMEPAD_A)              r.wButtons |= DS4_BUTTON_CROSS;
-    if (gp.wButtons & XUSB_GAMEPAD_B)              r.wButtons |= DS4_BUTTON_CIRCLE;
-    if (gp.wButtons & XUSB_GAMEPAD_X)              r.wButtons |= DS4_BUTTON_SQUARE;
-    if (gp.wButtons & XUSB_GAMEPAD_Y)              r.wButtons |= DS4_BUTTON_TRIANGLE;
-
-    // Shoulders / triggers
-    if (gp.wButtons & XUSB_GAMEPAD_LEFT_SHOULDER)  r.wButtons |= DS4_BUTTON_SHOULDER_LEFT;
-    if (gp.wButtons & XUSB_GAMEPAD_RIGHT_SHOULDER) r.wButtons |= DS4_BUTTON_SHOULDER_RIGHT;
-    if (gp.wButtons & XUSB_GAMEPAD_LEFT_THUMB)     r.wButtons |= DS4_BUTTON_THUMB_LEFT;
-    if (gp.wButtons & XUSB_GAMEPAD_RIGHT_THUMB)    r.wButtons |= DS4_BUTTON_THUMB_RIGHT;
-
-    // Menu / view → Options / Share
-    if (gp.wButtons & XUSB_GAMEPAD_START)          r.wButtons |= DS4_BUTTON_OPTIONS;
-    if (gp.wButtons & XUSB_GAMEPAD_BACK)           r.bSpecial |= DS4_SPECIAL_BUTTON_TOUCHPAD;
-
-    // Xbox guide button → DS4 touchpad click
-    // DS4 PS button is left unmapped (no XInput equivalent for the home button)
-    // bSpecial holds the PS and touchpad bits outside of wButtons.
-    if (gp.wButtons & XUSB_GAMEPAD_GUIDE)          r.bSpecial |= DS4_SPECIAL_BUTTON_TOUCHPAD;
-
-    // D-Pad via hat value.
-    // DS4_BUTTON_DPAD_* values live in the low 4 bits of wButtons as a hat
-    // (0=N, 1=NE, … 7=NW, 8=none).  DS4_REPORT_INIT sets the nibble to
-    // DS4_BUTTON_DPAD_NONE (0x08).  Because the face/shoulder buttons above
-    // already ORed bits into wButtons we must mask the low nibble to zero
-    // before writing the hat value — otherwise e.g. CROSS (0x20) leaks into
-    // the nibble and produces a bogus hat direction.
-    bool du = (gp.wButtons & XUSB_GAMEPAD_DPAD_UP)    != 0;
-    bool dd = (gp.wButtons & XUSB_GAMEPAD_DPAD_DOWN)  != 0;
-    bool dl = (gp.wButtons & XUSB_GAMEPAD_DPAD_LEFT)  != 0;
-    bool dr = (gp.wButtons & XUSB_GAMEPAD_DPAD_RIGHT) != 0;
-
-    DS4_DPAD_DIRECTIONS hat;
-    if      (du && dr)  hat = DS4_BUTTON_DPAD_NORTHEAST;
-    else if (du && dl)  hat = DS4_BUTTON_DPAD_NORTHWEST;
-    else if (dd && dr)  hat = DS4_BUTTON_DPAD_SOUTHEAST;
-    else if (dd && dl)  hat = DS4_BUTTON_DPAD_SOUTHWEST;
-    else if (du)        hat = DS4_BUTTON_DPAD_NORTH;
-    else if (dd)        hat = DS4_BUTTON_DPAD_SOUTH;
-    else if (dr)        hat = DS4_BUTTON_DPAD_EAST;
-    else if (dl)        hat = DS4_BUTTON_DPAD_WEST;
-    else                hat = DS4_BUTTON_DPAD_NONE;
-
-    r.wButtons = (r.wButtons & ~static_cast<USHORT>(0x000Fu)) | static_cast<USHORT>(hat & 0x000Fu);
-
-    // Analog
-    r.bTriggerL = gp.bLeftTrigger;
-    r.bTriggerR = gp.bRightTrigger;
-    r.bThumbLX  = ConvertAxis(gp.sThumbLX);
-    r.bThumbLY  = 255 - ConvertAxis(gp.sThumbLY);   // DS4 Y is inverted
-    r.bThumbRX  = ConvertAxis(gp.sThumbRX);
-    r.bThumbRY  = 255 - ConvertAxis(gp.sThumbRY);
-}
+// ConvertAxis / BuildX360Report / BuildDS4Report now live in report_builders.h
+// so they can be shared with the unit tests.
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Dashboard state — the hot polling loop only writes a small POD snapshot
@@ -401,8 +322,12 @@ static void RunPassthrough(ViGEmLoader& vigem, const ControllerSpoofProfile& pro
 
         lastTx = false;
         if (hasInput) {
-            // Unify into an XINPUT_GAMEPAD-shaped struct for the existing builders.
+            // Unify into an XINPUT_GAMEPAD-shaped struct plus the two DS4-only
+            // buttons (PS home + touchpad click) that have no XInput bit, so we
+            // can forward them without clobbering Share/Back.
             XINPUT_GAMEPAD gp{};
+            bool psButton = false;
+            bool touchpad = false;
             if (useRawHid) {
                 gp.sThumbLX      = hidState.leftX;
                 gp.sThumbLY      = hidState.leftY;
@@ -410,22 +335,27 @@ static void RunPassthrough(ViGEmLoader& vigem, const ControllerSpoofProfile& pro
                 gp.sThumbRY      = hidState.rightY;
                 gp.bLeftTrigger  = hidState.leftTrigger;
                 gp.bRightTrigger = hidState.rightTrigger;
-                gp.wButtons      = hidState.buttons;
-                // Touchpad click → treat as BACK so BuildDS4Report maps it to
-                // DS4_SPECIAL_BUTTON_TOUCHPAD via the existing XUSB_GAMEPAD_BACK path.
-                if (hidState.touchpad) gp.wButtons |= XUSB_GAMEPAD_BACK;
-                // PS button → guide
-                if (hidState.psButton) gp.wButtons |= XUSB_GAMEPAD_GUIDE;
+                gp.wButtons      = hidState.buttons;   // Share→BACK, Options→START already mapped
+                psButton         = hidState.psButton;
+                touchpad         = hidState.touchpad;
             } else {
-                gp = xState.Gamepad;
+                gp       = xState.Gamepad;
+                psButton = (gp.wButtons & XUSB_GAMEPAD_GUIDE) != 0;   // Guide/Home → PS
             }
 
             if (isDS4) {
-                BuildDS4Report(gp, ds4Out);
+                // Forward PS + touchpad click faithfully to the virtual DS4.
+                BuildDS4Report(gp, ds4Out, psButton, touchpad);
                 lastTx = vigem.UpdateDS4(target, ds4Out);
             } else {
-                BuildX360Report(gp, xOut);
+                // Xbox 360 target has no home/touchpad distinction: fold the PS
+                // button onto Guide and a touchpad click onto Back.
+                XINPUT_GAMEPAD gx = gp;
+                if (psButton) gx.wButtons |= XUSB_GAMEPAD_GUIDE;
+                if (touchpad) gx.wButtons |= XUSB_GAMEPAD_BACK;
+                BuildX360Report(gx, xOut);
                 lastTx = vigem.UpdateX360(target, xOut);
+                gp = gx;   // reflect folded buttons in the dashboard snapshot
             }
             packets++;
             if (!lastTx) fails++;

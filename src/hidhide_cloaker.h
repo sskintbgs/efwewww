@@ -30,15 +30,18 @@
 #pragma comment(lib, "setupapi.lib")
 
 // ─── HidHide IOCTL codes ──────────────────────────────────────────────────────
-// Derived from the HidHide v1.x public source (Nefarius/HidHide on GitHub).
-// Device type 0x8000, function base 0x800, METHOD_BUFFERED throughout.
-// FILE_READ_DATA  (0x0001) for GETs, FILE_WRITE_DATA (0x0002) for SETs.
-#define IOCTL_HIDHIDE_GET_WHITELIST   CTL_CODE(0x8000, 0x0800, METHOD_BUFFERED, FILE_READ_DATA)
-#define IOCTL_HIDHIDE_SET_WHITELIST   CTL_CODE(0x8000, 0x0801, METHOD_BUFFERED, FILE_WRITE_DATA)
-#define IOCTL_HIDHIDE_GET_BLACKLIST   CTL_CODE(0x8000, 0x0802, METHOD_BUFFERED, FILE_READ_DATA)
-#define IOCTL_HIDHIDE_SET_BLACKLIST   CTL_CODE(0x8000, 0x0803, METHOD_BUFFERED, FILE_WRITE_DATA)
-#define IOCTL_HIDHIDE_GET_ACTIVE      CTL_CODE(0x8000, 0x0804, METHOD_BUFFERED, FILE_READ_DATA)
-#define IOCTL_HIDHIDE_SET_ACTIVE      CTL_CODE(0x8000, 0x0805, METHOD_BUFFERED, FILE_WRITE_DATA)
+// These MUST match nefarius/HidHide's Shared/HidHideIoctlContract.h byte-for-byte
+// or DeviceIoControl fails with ERROR_INVALID_FUNCTION and cloaking silently
+// does nothing.  Two things are easy to get wrong (and were, previously):
+//   • the custom device type is 32769 (0x8001), NOT 0x8000, and
+//   • EVERY code — including the "set" ones — uses FILE_READ_DATA access.
+#define HIDHIDE_DEVICE_TYPE 32769
+#define IOCTL_HIDHIDE_GET_WHITELIST   CTL_CODE(HIDHIDE_DEVICE_TYPE, 2048, METHOD_BUFFERED, FILE_READ_DATA)
+#define IOCTL_HIDHIDE_SET_WHITELIST   CTL_CODE(HIDHIDE_DEVICE_TYPE, 2049, METHOD_BUFFERED, FILE_READ_DATA)
+#define IOCTL_HIDHIDE_GET_BLACKLIST   CTL_CODE(HIDHIDE_DEVICE_TYPE, 2050, METHOD_BUFFERED, FILE_READ_DATA)
+#define IOCTL_HIDHIDE_SET_BLACKLIST   CTL_CODE(HIDHIDE_DEVICE_TYPE, 2051, METHOD_BUFFERED, FILE_READ_DATA)
+#define IOCTL_HIDHIDE_GET_ACTIVE      CTL_CODE(HIDHIDE_DEVICE_TYPE, 2052, METHOD_BUFFERED, FILE_READ_DATA)
+#define IOCTL_HIDHIDE_SET_ACTIVE      CTL_CODE(HIDHIDE_DEVICE_TYPE, 2053, METHOD_BUFFERED, FILE_READ_DATA)
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -220,8 +223,8 @@ private:
     // Older builds used the bare HidHide name.  Try the modern path first.
     static HANDLE OpenHidHide() {
         static const wchar_t* kPaths[] = {
-            L"\\\\.\\HidHideDeviceConfiguration",
-            L"\\\\.\\HidHide",
+            L"\\\\.\\HidHide",                       // documented control-device name
+            L"\\\\.\\HidHideDeviceConfiguration",    // legacy fallback
         };
         for (const wchar_t* p : kPaths) {
             HANDLE h = CreateFileW(

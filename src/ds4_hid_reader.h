@@ -39,6 +39,11 @@
 #include <vector>
 #include <algorithm>
 
+// ViGEm Common.h defines the XUSB_GAMEPAD_* button constants used by the
+// parsers below.  Including it here (rather than relying on the includer to
+// pull it in first) makes this header self-contained and order-independent.
+#include "ViGEm/Common.h"
+
 #pragma comment(lib, "hid.lib")
 #pragma comment(lib, "setupapi.lib")
 
@@ -87,22 +92,26 @@ static const SonyPidEntry kSonyControllers[] = {
 // Byte  7: PS(0) Touchpad(1) ...
 // Byte  8: L2 axis
 // Byte  9: R2 axis
-#define DS4_RPT_LX      1
-#define DS4_RPT_LY      2
-#define DS4_RPT_RX      3
-#define DS4_RPT_RY      4
-#define DS4_RPT_BTNS0   5
-#define DS4_RPT_BTNS1   6
-#define DS4_RPT_BTNS2   7
-#define DS4_RPT_L2      8
-#define DS4_RPT_R2      9
-#define DS4_RPT_MIN_LEN 10
-
-// DualSense USB report layout is identical for the fields we care about.
+// Byte positions of the fields we care about inside a Sony input report.
+// DS4 and DualSense share the SAME bit meanings inside the three button bytes,
+// but they place the stick/trigger/button bytes at DIFFERENT offsets, and each
+// has a distinct USB vs Bluetooth framing.  GetSonyOffsets() resolves the right
+// set of offsets from the device type + report ID.
+struct SonyReportOffsets {
+    int lx, ly, rx, ry;   // stick byte positions
+    int l2, r2;           // analog trigger byte positions
+    int b0, b1, b2;       // button bytes: hat+face / shoulders+share+opts+thumbs / ps+touchpad
+};
 
 // ── Helper: map 0..255 axis to -32768..32767 ─────────────────────────────────
 static inline int16_t HidAxisToXInput(uint8_t v) {
-    return static_cast<int16_t>((static_cast<int>(v) - 128) * 257);
+    // (v-128)*257 spans -32896..32639, so the negative end overflows a signed
+    // 16-bit value: byte 0 would wrap to +32640 (wrong sign!).  Compute in a
+    // wide int and clamp to the int16 range so the extremes stay correct.
+    int scaled = (static_cast<int>(v) - 128) * 257;
+    if (scaled < -32768) scaled = -32768;
+    if (scaled >  32767) scaled =  32767;
+    return static_cast<int16_t>(scaled);
 }
 
 // ── Helper: map a raw HID logical value to -32768..32767 ─────────────────────
@@ -124,6 +133,13 @@ struct HidGamepadCandidate {
     bool           isSony         = false;
     SonyDeviceType sonyType       = SonyDeviceType::DS4;
     const char*    friendlyName   = "Generic HID Gamepad";
+    // How good this HID collection is for our purposes.  A single physical
+    // device (e.g. DualSense Edge) exposes several HID collections under the
+    // same VID/PID; we keep the highest-scoring one:
+    //   3 = Sony device + gamepad/joystick collection (richest structured parse)
+    //   2 = generic gamepad/joystick collection
+    //   1 = Sony device, non-gamepad collection (audio/vendor/touchpad)
+    int            score          = 0;
 };
 
 // ── Main class ───────────────────────────────────────────────────────────────
@@ -183,10 +199,21 @@ public:
         deviceName_ = chosen->friendlyName;
         hEvent_     = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 
-        // Cache the preparsed data for generic HID parsing.
+        // Cache the preparsed data (and value caps) for generic HID parsing so
+        // the hot Read() path never has to re-query them.
         if (!isSony_) {
             HidD_GetPreparsedData(hDev_, &ppd_);
-            if (ppd_) HidP_GetCaps(ppd_, &hidCaps_);
+            if (ppd_) {
+                HidP_GetCaps(ppd_, &hidCaps_);
+                USHORT n = hidCaps_.NumberInputValueCaps;
+                if (n) {
+                    valueCaps_.resize(n);
+                    if (HidP_GetValueCaps(HidP_Input, valueCaps_.data(), &n, ppd_) == HIDP_STATUS_SUCCESS)
+                        valueCaps_.resize(n);
+                    else
+                        valueCaps_.clear();
+                }
+            }
         }
 
         return true;
@@ -210,6 +237,7 @@ public:
         isSony_     = false;
         sonyType_   = SonyDeviceType::DS4;
         ZeroMemory(&hidCaps_, sizeof(hidCaps_));
+        valueCaps_.clear();
     }
 
     // Non-blocking read: issues an overlapped ReadFile then waits up to
@@ -241,46 +269,96 @@ public:
         if (bytesRead == 0) return false;
 
         if (isSony_) {
-            if (sonyType_ == SonyDeviceType::DualSense) {
-                // DualSense / DualSense Edge over USB: report ID 0x01.
-                // The core data bytes (sticks, hat, buttons, triggers) sit at
-                // exactly the same offsets as DS4 USB (bytes 1-9).
-                if (buf[0] == 0x01 && bytesRead >= DS4_RPT_MIN_LEN) {
-                    return ParseDS4(buf, bytesRead, out);
-                }
-                // DualSense over Bluetooth: report ID 0x31 (49 decimal).
-                // The payload starts at byte 2 (byte 1 is a BT sequence byte).
-                // Core layout relative to byte 2:
-                //   +0 LX, +1 LY, +2 RX, +3 RY, +4 buttons0, +5 buttons1,
-                //   +6 buttons2, +7 L2 axis, +8 R2 axis.
-                if (buf[0] == 0x31 && bytesRead >= 12) {
-                    // Rewrite into a synthetic DS4-style buffer so ParseDS4
-                    // can be reused without changes.
-                    uint8_t synth[DS4_RPT_MIN_LEN] = {};
-                    synth[0] = 0x01;          // fake report ID
-                    synth[DS4_RPT_LX]    = buf[2];   // LX
-                    synth[DS4_RPT_LY]    = buf[3];   // LY
-                    synth[DS4_RPT_RX]    = buf[4];   // RX
-                    synth[DS4_RPT_RY]    = buf[5];   // RY
-                    synth[DS4_RPT_BTNS0] = buf[6];   // hat + face buttons
-                    synth[DS4_RPT_BTNS1] = buf[7];   // L1 R1 L2 R2 share opts L3 R3
-                    synth[DS4_RPT_BTNS2] = buf[8];   // PS touchpad
-                    synth[DS4_RPT_L2]    = buf[9];   // L2 axis
-                    synth[DS4_RPT_R2]    = buf[10];  // R2 axis
-                    return ParseDS4(synth, DS4_RPT_MIN_LEN, out);
-                }
-                // Unrecognised report — skip silently (no false returns that
-                // would cause the reader to close the device).
+            SonyReportOffsets off;
+            if (!GetSonyOffsets(sonyType_, buf, bytesRead, off)) {
+                // Unrecognised or too-short report (e.g. a DualSense Bluetooth
+                // "minimal" report before full mode is enabled).  Skip silently
+                // so a single odd packet doesn't tear down the device handle.
                 return false;
-            } else {
-                // DS4: USB only (report 0x01).
-                if (bytesRead < DS4_RPT_MIN_LEN || buf[0] != 0x01) return false;
-                return ParseDS4(buf, bytesRead, out);
             }
+            return ParseSonyReport(buf, off, out);
         } else {
             // Generic HID gamepad: use HID parser API.
             return ParseGeneric(buf, bytesRead, out);
         }
+    }
+
+    // ── Resolve Sony report byte offsets from device type + report ID ─────────
+    // DS4 and DualSense share button-bit meanings but differ in byte layout and
+    // USB/Bluetooth framing.  Returns false if the report ID/length isn't a
+    // full input report we know how to decode.
+    static bool GetSonyOffsets(SonyDeviceType type, const uint8_t* buf, DWORD len, SonyReportOffsets& o) {
+        const uint8_t id = buf[0];
+        if (type == SonyDeviceType::DS4) {
+            if (id == 0x01) {                 // DS4 USB
+                o = { 1,2,3,4, 8,9, 5,6,7 };
+                return len >= 10;
+            }
+            if (id == 0x11) {                 // DS4 Bluetooth (2 header bytes 0xC0 0x00 → body +2)
+                o = { 3,4,5,6, 10,11, 7,8,9 };
+                return len >= 12;
+            }
+            return false;
+        }
+        // DualSense / DualSense Edge
+        if (id == 0x01) {                     // DualSense USB
+            o = { 1,2,3,4, 5,6, 8,9,10 };
+            return len >= 11;
+        }
+        if (id == 0x31) {                     // DualSense Bluetooth (1 header byte → body +1)
+            o = { 2,3,4,5, 6,7, 9,10,11 };
+            return len >= 12;
+        }
+        return false;
+    }
+
+    // ── Structured Sony DS4 / DualSense parse (USB + Bluetooth) ───────────────
+    // Reads sticks, analog triggers, dpad hat, face/shoulder/thumb buttons and
+    // the Share/Options/PS/touchpad specials into the normalised state.  Static
+    // and dependency-free so it can be unit-tested with synthetic buffers.
+    static bool ParseSonyReport(const uint8_t* b, const SonyReportOffsets& o, PhysicalGamepadState& s) {
+        s = {};
+
+        // Sticks (DS/DualSense Y grows downward, so invert to XInput's up-positive).
+        s.leftX  =  HidAxisToXInput(b[o.lx]);
+        s.leftY  = -HidAxisToXInput(b[o.ly]) - 1;
+        s.rightX =  HidAxisToXInput(b[o.rx]);
+        s.rightY = -HidAxisToXInput(b[o.ry]) - 1;
+
+        // Analog triggers
+        s.leftTrigger  = b[o.l2];
+        s.rightTrigger = b[o.r2];
+
+        // Button byte 0: dpad hat (low nibble) + face buttons (high nibble)
+        uint8_t dpad = b[o.b0] & 0x0F;
+        bool du = (dpad == 0 || dpad == 1 || dpad == 7);
+        bool dr = (dpad == 1 || dpad == 2 || dpad == 3);
+        bool dd = (dpad == 3 || dpad == 4 || dpad == 5);
+        bool dl = (dpad == 5 || dpad == 6 || dpad == 7);
+        if (du) s.buttons |= XUSB_GAMEPAD_DPAD_UP;
+        if (dr) s.buttons |= XUSB_GAMEPAD_DPAD_RIGHT;
+        if (dd) s.buttons |= XUSB_GAMEPAD_DPAD_DOWN;
+        if (dl) s.buttons |= XUSB_GAMEPAD_DPAD_LEFT;
+
+        if (b[o.b0] & 0x10) s.buttons |= XUSB_GAMEPAD_X;   // Square   → X
+        if (b[o.b0] & 0x20) s.buttons |= XUSB_GAMEPAD_A;   // Cross    → A
+        if (b[o.b0] & 0x40) s.buttons |= XUSB_GAMEPAD_B;   // Circle   → B
+        if (b[o.b0] & 0x80) s.buttons |= XUSB_GAMEPAD_Y;   // Triangle → Y
+
+        // Button byte 1: L1 R1 L2 R2 Share/Create Options L3 R3
+        if (b[o.b1] & 0x01) s.buttons |= XUSB_GAMEPAD_LEFT_SHOULDER;
+        if (b[o.b1] & 0x02) s.buttons |= XUSB_GAMEPAD_RIGHT_SHOULDER;
+        if (b[o.b1] & 0x10) s.buttons |= XUSB_GAMEPAD_BACK;    // Share/Create → Back/View
+        if (b[o.b1] & 0x20) s.buttons |= XUSB_GAMEPAD_START;   // Options      → Start/Menu
+        if (b[o.b1] & 0x40) s.buttons |= XUSB_GAMEPAD_LEFT_THUMB;
+        if (b[o.b1] & 0x80) s.buttons |= XUSB_GAMEPAD_RIGHT_THUMB;
+
+        // Button byte 2: PS (bit0) + touchpad click (bit1)
+        s.psButton = (b[o.b2] & 0x01) != 0;
+        s.touchpad = (b[o.b2] & 0x02) != 0;
+
+        s.valid = true;
+        return true;
     }
 
 private:
@@ -291,6 +369,9 @@ private:
     SonyDeviceType       sonyType_   = SonyDeviceType::DS4;
     PHIDP_PREPARSED_DATA ppd_        = nullptr;
     HIDP_CAPS            hidCaps_    = {};
+    // Value caps cached at Open() so the generic-parse hot path never re-queries
+    // them (HidP_GetValueCaps + a heap allocation on every poll otherwise).
+    std::vector<HIDP_VALUE_CAPS> valueCaps_;
 
     // ── Enumerate all HID gamepads/joysticks currently attached ──────────────
     // Uses HID usage page / usage to identify game controllers regardless of
@@ -402,43 +483,21 @@ private:
 
             // Tag each candidate with how "good" it is so we can pick the
             // right collection when the same device has multiple interfaces.
-            // Score: Sony gamepad collection = 3, Sony other = 1, Generic gamepad = 2.
-            // Higher score wins during selection in Open().
-            int score = 0;
-            if (c.isSony && isStandardGamepad)  score = 3;
-            else if (!c.isSony && isStandardGamepad) score = 2;
-            else if (c.isSony)                   score = 1;
+            //   3 = Sony device + gamepad/joystick collection
+            //   2 = generic gamepad/joystick collection
+            //   1 = Sony device, non-gamepad collection
+            if (c.isSony && isStandardGamepad)       c.score = 3;
+            else if (!c.isSony && isStandardGamepad) c.score = 2;
+            else if (c.isSony)                       c.score = 1;
 
-            // If we already have a candidate from the same device (same VID/PID
-            // and same devicePath prefix up to the MI_ part), replace it only if
-            // this one scores higher.  Otherwise just append.
+            // Collapse the multiple HID collections a single physical device may
+            // expose (same VID/PID) down to the highest-scoring one, so we end
+            // up talking to the gamepad collection rather than, say, the
+            // DualSense's audio or vendor-specific interface.
             bool replaced = false;
             for (auto& existing : out) {
                 if (existing.vid == c.vid && existing.pid == c.pid) {
-                    // Same physical device, different HID collection.
-                    // Keep the one with the higher score (gamepad collection wins).
-                    // Re-use the score field via a small helper lambda.
-                    auto existingScore = [&]() {
-                        // We can tell by friendlyName / isSony; recompute score.
-                        // Sony+gamepad path = path that was taken for existing.
-                        // Easier: just always replace if our score is higher
-                        // (we track this by re-scoring existing implicitly —
-                        //  if existing isSony and its path got score 3 it would
-                        //  not be replaced by score 1 or 2).
-                        // Simple proxy: assume score stored in a notional field.
-                        // Since we can't store score in HidGamepadCandidate without
-                        // changing the struct, use a string heuristic: a Sony
-                        // standard-gamepad interface path contains "&col01" or
-                        // a lower collection index.  Instead, just replace if
-                        // the new candidate is isSony+isStandardGamepad and the
-                        // existing one is not the same combo.
-                        return (existing.isSony && isStandardGamepad) ? 3
-                             : (!existing.isSony && isStandardGamepad) ? 2
-                             : existing.isSony ? 1 : 0;
-                    };
-                    if (score > existingScore()) {
-                        existing = std::move(c);
-                    }
+                    if (c.score > existing.score) existing = std::move(c);
                     replaced = true;
                     break;
                 }
@@ -450,54 +509,6 @@ private:
 
         SetupDiDestroyDeviceInfoList(devInfo);
         return out;
-    }
-
-    // ── Sony DS4 / DualSense structured parse ─────────────────────────────────
-    static bool ParseDS4(const uint8_t* b, DWORD /*len*/, PhysicalGamepadState& s) {
-        s = {};
-
-        // Sticks
-        s.leftX  =  HidAxisToXInput(b[DS4_RPT_LX]);
-        s.leftY  = -HidAxisToXInput(b[DS4_RPT_LY]) - 1;  // invert Y
-        s.rightX =  HidAxisToXInput(b[DS4_RPT_RX]);
-        s.rightY = -HidAxisToXInput(b[DS4_RPT_RY]) - 1;
-
-        // Triggers
-        s.leftTrigger  = b[DS4_RPT_L2];
-        s.rightTrigger = b[DS4_RPT_R2];
-
-        // ── Byte 5: dpad (low nibble) + face buttons (high nibble) ──────────
-        uint8_t dpad = b[DS4_RPT_BTNS0] & 0x0F;
-        // Hat: 0=N 1=NE 2=E 3=SE 4=S 5=SW 6=W 7=NW 8=none
-        bool du = (dpad == 0 || dpad == 1 || dpad == 7);
-        bool dr = (dpad == 1 || dpad == 2 || dpad == 3);
-        bool dd = (dpad == 3 || dpad == 4 || dpad == 5);
-        bool dl = (dpad == 5 || dpad == 6 || dpad == 7);
-        if (du) s.buttons |= XUSB_GAMEPAD_DPAD_UP;
-        if (dr) s.buttons |= XUSB_GAMEPAD_DPAD_RIGHT;
-        if (dd) s.buttons |= XUSB_GAMEPAD_DPAD_DOWN;
-        if (dl) s.buttons |= XUSB_GAMEPAD_DPAD_LEFT;
-
-        // Face buttons: Square=X, Cross=A, Circle=B, Triangle=Y
-        if (b[DS4_RPT_BTNS0] & 0x10) s.buttons |= XUSB_GAMEPAD_X;
-        if (b[DS4_RPT_BTNS0] & 0x20) s.buttons |= XUSB_GAMEPAD_A;
-        if (b[DS4_RPT_BTNS0] & 0x40) s.buttons |= XUSB_GAMEPAD_B;
-        if (b[DS4_RPT_BTNS0] & 0x80) s.buttons |= XUSB_GAMEPAD_Y;
-
-        // ── Byte 6: L1 R1 L2 R2 Share Options L3 R3 ─────────────────────────
-        if (b[DS4_RPT_BTNS1] & 0x01) s.buttons |= XUSB_GAMEPAD_LEFT_SHOULDER;
-        if (b[DS4_RPT_BTNS1] & 0x02) s.buttons |= XUSB_GAMEPAD_RIGHT_SHOULDER;
-        if (b[DS4_RPT_BTNS1] & 0x10) s.buttons |= XUSB_GAMEPAD_BACK;
-        if (b[DS4_RPT_BTNS1] & 0x20) s.buttons |= XUSB_GAMEPAD_START;
-        if (b[DS4_RPT_BTNS1] & 0x40) s.buttons |= XUSB_GAMEPAD_LEFT_THUMB;
-        if (b[DS4_RPT_BTNS1] & 0x80) s.buttons |= XUSB_GAMEPAD_RIGHT_THUMB;
-
-        // ── Byte 7: PS Touchpad ───────────────────────────────────────────────
-        s.psButton = (b[DS4_RPT_BTNS2] & 0x01) != 0;
-        s.touchpad = (b[DS4_RPT_BTNS2] & 0x02) != 0;
-
-        s.valid = true;
-        return true;
     }
 
     // ── Generic HID gamepad parse using preparsed data ────────────────────────
@@ -531,18 +542,13 @@ private:
             );
             if (st != HIDP_STATUS_SUCCESS) continue;
 
-            // Query the value caps to get the logical min/max.
-            USHORT numCaps = hidCaps_.NumberInputValueCaps;
-            std::vector<HIDP_VALUE_CAPS> vcaps(numCaps);
-            HidP_GetValueCaps(HidP_Input, vcaps.data(), &numCaps, ppd_);
-
+            // Logical min/max come from the value caps cached at Open(), so the
+            // hot path does no per-poll re-query or heap allocation.
             LONG logMin = 0, logMax = 255;
-            for (USHORT j = 0; j < numCaps; j++) {
-                if (!vcaps[j].IsRange && vcaps[j].NotRange.Usage == am.usage &&
-                    vcaps[j].UsagePage == 0x01)
-                {
-                    logMin = vcaps[j].LogicalMin;
-                    logMax = vcaps[j].LogicalMax;
+            for (const auto& vc : valueCaps_) {
+                if (!vc.IsRange && vc.UsagePage == 0x01 && vc.NotRange.Usage == am.usage) {
+                    logMin = vc.LogicalMin;
+                    logMax = vc.LogicalMax;
                     break;
                 }
             }
