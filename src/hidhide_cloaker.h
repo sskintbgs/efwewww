@@ -95,6 +95,23 @@ static std::vector<BYTE> SerializeMultiSz(const std::vector<std::wstring>& v) {
     return out;
 }
 
+// Compose a HidHide-style whitelist entry from a Win32 path and the NT device
+// name of its drive.  HidHide stores whitelisted process images in "DOS device
+// notation" (e.g. \Device\HarddiskVolume3\dir\app.exe), NOT the C:\ form; if the
+// format doesn't match, HidHide never recognises the process as whitelisted and
+// will hide controllers from it too.  Example:
+//   ("C:\\dir\\app.exe", "\\Device\\HarddiskVolume3")
+//     -> "\\Device\\HarddiskVolume3\\dir\\app.exe"
+// Pure and dependency-free so it can be unit-tested. Returns empty on malformed
+// input (caller should fall back to the raw path).
+inline std::wstring HidHideComposeDosDevicePath(const std::wstring& win32Path,
+                                                const std::wstring& driveDosDevice) {
+    if (driveDosDevice.empty()) return {};
+    if (win32Path.size() < 3 || win32Path[1] != L':' || win32Path[2] != L'\\') return {};
+    // win32Path.substr(2) keeps the leading "\", giving "\dir\app.exe".
+    return driveDosDevice + win32Path.substr(2);
+}
+
 // ─── Main class ──────────────────────────────────────────────────────────────
 
 class HidHideCloaker {
@@ -105,6 +122,7 @@ public:
         bool        wasAlreadyActive = false;
         int         devicesCloaked   = 0;
         bool        whitelistAdded   = false;
+        bool        whitelistVerified = true;
         std::string statusMessage;
     };
 
@@ -141,15 +159,34 @@ public:
 
         // ── 2. Whitelist this executable ──────────────────────────────────
         std::wstring exePath = GetOwnExePath();
-        auto wl = savedWhitelist_;
+        bool whitelisted = false;
         if (!exePath.empty()) {
+            auto wl = savedWhitelist_;
             bool already = std::find(wl.begin(), wl.end(), exePath) != wl.end();
-            if (!already) {
+            if (already) {
+                whitelisted = true;
+            } else {
                 wl.push_back(exePath);
                 SetWhitelist(wl);
                 ownExeAddedToWhitelist_ = true;
                 r.whitelistAdded = true;
+                // Verify the entry actually took: a wrong path format or an
+                // access failure would otherwise silently lock THIS process out
+                // of any device we then cloak.
+                auto after = GetWhitelist();
+                whitelisted = std::find(after.begin(), after.end(), exePath) != after.end();
             }
+        }
+        r.whitelistVerified = whitelisted;
+
+        if (!whitelisted) {
+            // Refuse to cloak while unwhitelisted — hiding the controller would
+            // make it unreadable by us too (the reported "not picked up" bug).
+            std::ostringstream ss;
+            ss << "HidHide present but this app could not be whitelisted; skipping "
+               << "cloaking so the controller stays readable by this app.";
+            r.statusMessage = ss.str();
+            return r;   // Restore() still cleans up the whitelist entry we tried.
         }
 
         // ── 3. Cloak physical HID game controllers ────────────────────────
@@ -182,8 +219,11 @@ public:
     }
 
     // Undo everything Apply() did.  Called automatically by the destructor.
+    // Also runs when cloaking was skipped but a whitelist entry was added on the
+    // fail-safe path, so that entry is still cleaned up.
     void Restore() {
-        if (!applied_ || hDevice_ == INVALID_HANDLE_VALUE) return;
+        if (hDevice_ == INVALID_HANDLE_VALUE) return;
+        if (!applied_ && !ownExeAddedToWhitelist_) return;
 
         // Remove entries we added to the blacklist.
         if (!addedToBlacklist_.empty()) {
@@ -308,8 +348,19 @@ private:
     // ── Own executable path ────────────────────────────────────────────────
     static std::wstring GetOwnExePath() {
         wchar_t buf[MAX_PATH] = {};
-        GetModuleFileNameW(nullptr, buf, MAX_PATH);
-        return buf;
+        if (GetModuleFileNameW(nullptr, buf, MAX_PATH) == 0) return {};
+        std::wstring win32Path = buf;   // e.g. C:\dir\app.exe
+
+        // Convert to the DOS device notation HidHide's whitelist expects.
+        if (win32Path.size() >= 2 && win32Path[1] == L':') {
+            wchar_t drive[3] = { win32Path[0], L':', L'\0' };   // "C:" (no trailing slash)
+            wchar_t dosDev[512] = {};
+            if (QueryDosDeviceW(drive, dosDev, 512) != 0) {
+                std::wstring composed = HidHideComposeDosDevicePath(win32Path, dosDev);
+                if (!composed.empty()) return composed;
+            }
+        }
+        return win32Path;   // best-effort fallback
     }
 
     // ── Enumerate HID game controllers ────────────────────────────────────

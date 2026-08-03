@@ -13,6 +13,7 @@
 
 #include "ds4_hid_reader.h"     // HidAxisToXInput, SonyReportOffsets, DS4HidReader::ParseSonyReport/GetSonyOffsets
 #include "report_builders.h"    // ConvertAxis, BuildX360Report, BuildDS4Report
+#include "hidhide_cloaker.h"    // HidHideComposeDosDevicePath
 
 static int g_pass = 0;
 static int g_fail = 0;
@@ -175,6 +176,25 @@ int main() {
         check_eq(r.wButtons, gp.wButtons, "buttons copied verbatim (incl. GUIDE)");
         check_eq(r.bLeftTrigger, 55, "left trigger copied");
         check_eq(r.sThumbRX, 12345, "right stick X copied");
+    }
+
+    std::printf("\n== HidHide whitelist path (DOS device notation) ==\n");
+    {
+        auto narrow = [](const std::wstring& w) { std::string s; for (wchar_t c : w) s += (char)(c & 0x7F); return s; };
+        auto check_ws = [&](const std::wstring& got, const std::wstring& want, const char* what) {
+            if (got == want) { ++g_pass; std::printf("  [PASS] %s\n", what); }
+            else { ++g_fail; std::printf("  [FAIL] %s (got '%s')\n", what, narrow(got).c_str()); }
+        };
+        check_ws(HidHideComposeDosDevicePath(L"C:\\Games\\app.exe", L"\\Device\\HarddiskVolume3"),
+                 L"\\Device\\HarddiskVolume3\\Games\\app.exe",
+                 "C: path -> DOS device notation");
+        check_ws(HidHideComposeDosDevicePath(L"D:\\a\\b\\pass.exe", L"\\Device\\HarddiskVolume7"),
+                 L"\\Device\\HarddiskVolume7\\a\\b\\pass.exe",
+                 "D: path -> DOS device notation");
+        check(HidHideComposeDosDevicePath(L"C:\\x.exe", L"").empty(),
+              "empty drive device -> empty");
+        check(HidHideComposeDosDevicePath(L"relative\\x.exe", L"\\Device\\HarddiskVolume1").empty(),
+              "non-drive path -> empty");
     }
 
     std::printf("\n==============================\n");
