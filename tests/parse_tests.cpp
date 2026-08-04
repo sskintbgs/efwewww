@@ -273,6 +273,12 @@ int main() {
               "empty drive device -> empty");
         check(HidHideComposeDosDevicePath(L"relative\\x.exe", L"\\Device\\HarddiskVolume1").empty(),
               "non-drive path -> empty");
+
+        auto emptyMultiSz = SerializeMultiSz({});
+        check_eq(emptyMultiSz.size(), 2 * sizeof(wchar_t),
+                 "empty MULTI_SZ contains two wide null terminators");
+        check(ParseMultiSz(emptyMultiSz).empty(),
+              "empty MULTI_SZ round-trips as an empty list");
     }
 
     std::printf("\n==============================\n");
