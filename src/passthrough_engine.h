@@ -65,6 +65,9 @@ public:
     // or ViGEm isn't connected.
     bool Start(ViGEmLoader& vigem, const ControllerSpoofProfile& profile, const Options& opt) {
         if (running_.load()) return false;
+        // A prior worker may have exited asynchronously after publishing an
+        // error. It must be joined before assigning a new std::thread.
+        if (worker_.joinable()) worker_.join();
         if (!vigem.isLoaded)  return false;
         stop_.store(false);
         pollHz_.store(std::max(125u, std::min(1000u, opt.pollHz)));
@@ -140,6 +143,8 @@ private:
         // can win enumeration and the passthrough reads its own output.
         DS4HidReader hidReader;
         const bool useRawHid = hidReader.Open();
+        const uint8_t xinputMaskBeforeTarget =
+            (!isDS4 && !useRawHid) ? ConnectedXInputMask() : 0;
 
         ViGEmTargetImpl* target = vigem->CreateTarget(vtype, profile.vendorId, profile.productId);
         if (!target || !vigem->AddTarget(target)) {
@@ -157,7 +162,10 @@ private:
             // Never poll XInput until our own slot is known unequivocally.
             for (int attempt = 0; attempt < 50 && ownVirtualXInputSlot >= XUSER_MAX_COUNT; ++attempt) {
                 DWORD index = XUSER_MAX_COUNT;
-                if (vigem->GetX360UserIndex(target, index) && index < XUSER_MAX_COUNT)
+                const bool gotIndex = vigem->GetX360UserIndex(target, index);
+                const uint8_t currentMask = ConnectedXInputMask();
+                if (gotIndex &&
+                    IsVerifiedVirtualXInputSlot(index, xinputMaskBeforeTarget, currentMask))
                     ownVirtualXInputSlot = index;
                 else
                     Sleep(10);
@@ -188,7 +196,9 @@ private:
         XINPUT_GAMEPAD lastGamepad{};
         bool lastPsButton = false, lastTouchpad = false;
         bool wasConnected = sourceConnected;
+        bool neutralPending = false;
         auto nextHidReconnect = std::chrono::steady_clock::now();
+        auto nextNeutralRetry = nextHidReconnect;
 
         while (!stop_.load(std::memory_order_relaxed)) {
             PhysicalGamepadState hidState;
@@ -199,24 +209,20 @@ private:
                 if (!hidReader.IsOpen() && now >= nextHidReconnect) {
                     // ViGEm descendants are filtered during enumeration, so a
                     // replugged/re-paired physical controller can be selected.
-                    hidReader.Open();
+                    if (hidReader.Open() && cloaker.IsApplied())
+                        cloakResult.devicesCloaked += cloaker.Refresh();
                     nextHidReconnect = now + std::chrono::milliseconds(500);
                 }
                 if (hidReader.IsOpen()) hasPacket = hidReader.Read(hidState);
                 sourceConnected = hidReader.IsOpen();
             } else {
-                XINPUT_STATE states[XUSER_MAX_COUNT] = {};
-                uint8_t connectedMask = 0;
-                for (DWORD candidate = 0; candidate < XUSER_MAX_COUNT; ++candidate) {
-                    if (XInputGetStateWithGuide(candidate, &states[candidate]) == ERROR_SUCCESS)
-                        connectedMask |= static_cast<uint8_t>(1u << candidate);
-                }
-
-                activeXInputSlot = SelectPhysicalXInputSlot(
-                    slot_.load(), ownVirtualXInputSlot, connectedMask);
-                sourceConnected = activeXInputSlot < XUSER_MAX_COUNT;
+                activeXInputSlot = slot_.load() % XUSER_MAX_COUNT;
+                XINPUT_STATE state = {};
+                sourceConnected =
+                    activeXInputSlot != ownVirtualXInputSlot &&
+                    XInputGetStateWithGuide(activeXInputSlot, &state) == ERROR_SUCCESS;
                 hasPacket = sourceConnected;
-                if (sourceConnected) lastGamepad = states[activeXInputSlot].Gamepad;
+                if (sourceConnected) lastGamepad = state.Gamepad;
             }
 
             if (hasPacket) {
@@ -256,11 +262,17 @@ private:
             }
 
             if (wasConnected && !sourceConnected) {
-                // ViGEm retains the last report indefinitely. Send one neutral
-                // frame on a real disconnect so buttons/sticks cannot stay held.
+                neutralPending = true;
                 lastGamepad = {};
                 lastPsButton = false;
                 lastTouchpad = false;
+            }
+            if (hasPacket) neutralPending = false;
+
+            auto now = std::chrono::steady_clock::now();
+            if (neutralPending && now >= nextNeutralRetry) {
+                // ViGEm retains the last report indefinitely. Retry a neutral
+                // frame until it succeeds so inputs cannot remain held.
                 if (isDS4) {
                     BuildDS4Report(lastGamepad, ds4Out);
                     lastTx = vigem->UpdateDS4(target, ds4Out);
@@ -269,7 +281,12 @@ private:
                     lastTx = vigem->UpdateX360(target, xOut);
                 }
                 ++packets;
-                if (!lastTx) ++fails;
+                if (lastTx) {
+                    neutralPending = false;
+                } else {
+                    ++fails;
+                    nextNeutralRetry = now + std::chrono::milliseconds(50);
+                }
             }
             wasConnected = sourceConnected;
 

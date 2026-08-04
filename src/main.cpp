@@ -215,6 +215,8 @@ static void RunPassthrough(ViGEmLoader& vigem, const ControllerSpoofProfile& pro
     // a ViGEm DS4 cannot be selected as this passthrough's own input.
     DS4HidReader hidReader;
     const bool useRawHid = hidReader.Open();
+    const uint8_t xinputMaskBeforeTarget =
+        (!isDS4 && !useRawHid) ? ConnectedXInputMask() : 0;
     const char* inputSource = useRawHid
         ? hidReader.DeviceName()
         : "XInput (waiting for physical controller)";
@@ -235,7 +237,10 @@ static void RunPassthrough(ViGEmLoader& vigem, const ControllerSpoofProfile& pro
     if (!isDS4 && !useRawHid) {
         for (int attempt = 0; attempt < 50 && ownVirtualXInputSlot >= XUSER_MAX_COUNT; ++attempt) {
             DWORD index = XUSER_MAX_COUNT;
-            if (vigem.GetX360UserIndex(target, index) && index < XUSER_MAX_COUNT)
+            const bool gotIndex = vigem.GetX360UserIndex(target, index);
+            const uint8_t currentMask = ConnectedXInputMask();
+            if (gotIndex &&
+                IsVerifiedVirtualXInputSlot(index, xinputMaskBeforeTarget, currentMask))
                 ownVirtualXInputSlot = index;
             else
                 Sleep(10);
@@ -276,7 +281,9 @@ static void RunPassthrough(ViGEmLoader& vigem, const ControllerSpoofProfile& pro
     DWORD activeXInputSlot = g_xinputSlot.load();
     XINPUT_GAMEPAD lastGamepad{};
     bool wasConnected = sourceConnected;
+    bool neutralPending = false;
     auto nextHidReconnect = std::chrono::steady_clock::now();
+    auto nextNeutralRetry = nextHidReconnect;
 
     ClearScreen();
 
@@ -300,7 +307,8 @@ static void RunPassthrough(ViGEmLoader& vigem, const ControllerSpoofProfile& pro
         if (useRawHid) {
             auto now = std::chrono::steady_clock::now();
             if (!hidReader.IsOpen() && now >= nextHidReconnect) {
-                hidReader.Open();
+                if (hidReader.Open() && cloaker.IsApplied())
+                    cloakResult.devicesCloaked += cloaker.Refresh();
                 nextHidReconnect = now + std::chrono::milliseconds(500);
             }
             if (hidReader.IsOpen()) hasPacket = hidReader.Read(hidState);
@@ -309,18 +317,13 @@ static void RunPassthrough(ViGEmLoader& vigem, const ControllerSpoofProfile& pro
                 ? hidReader.DeviceName()
                 : "Raw HID (reconnecting)";
         } else {
-            XINPUT_STATE states[XUSER_MAX_COUNT] = {};
-            uint8_t connectedMask = 0;
-            for (DWORD candidate = 0; candidate < XUSER_MAX_COUNT; ++candidate) {
-                if (XInputGetStateWithGuide(candidate, &states[candidate]) == ERROR_SUCCESS)
-                    connectedMask |= static_cast<uint8_t>(1u << candidate);
-            }
-
-            activeXInputSlot = SelectPhysicalXInputSlot(
-                g_xinputSlot.load(), ownVirtualXInputSlot, connectedMask);
-            sourceConnected = activeXInputSlot < XUSER_MAX_COUNT;
+            activeXInputSlot = g_xinputSlot.load() % XUSER_MAX_COUNT;
+            XINPUT_STATE state = {};
+            sourceConnected =
+                activeXInputSlot != ownVirtualXInputSlot &&
+                XInputGetStateWithGuide(activeXInputSlot, &state) == ERROR_SUCCESS;
             hasPacket = sourceConnected;
-            if (sourceConnected) lastGamepad = states[activeXInputSlot].Gamepad;
+            if (sourceConnected) lastGamepad = state.Gamepad;
             inputSource = sourceConnected
                 ? "XInput"
                 : "XInput (waiting for physical controller)";
@@ -369,7 +372,13 @@ static void RunPassthrough(ViGEmLoader& vigem, const ControllerSpoofProfile& pro
         }
 
         if (wasConnected && !sourceConnected) {
+            neutralPending = true;
             lastGamepad = {};
+        }
+        if (hasPacket) neutralPending = false;
+
+        auto now = std::chrono::steady_clock::now();
+        if (neutralPending && now >= nextNeutralRetry) {
             if (isDS4) {
                 BuildDS4Report(lastGamepad, ds4Out);
                 lastTx = vigem.UpdateDS4(target, ds4Out);
@@ -378,7 +387,12 @@ static void RunPassthrough(ViGEmLoader& vigem, const ControllerSpoofProfile& pro
                 lastTx = vigem.UpdateX360(target, xOut);
             }
             packets++;
-            if (!lastTx) fails++;
+            if (lastTx) {
+                neutralPending = false;
+            } else {
+                fails++;
+                nextNeutralRetry = now + std::chrono::milliseconds(50);
+            }
         }
         wasConnected = sourceConnected;
 

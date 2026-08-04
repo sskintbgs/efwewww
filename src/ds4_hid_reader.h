@@ -43,7 +43,6 @@ extern "C" {
 #include <cfgmgr32.h>
 #include <cstdint>
 #include <cstdio>
-#include <cwctype>
 #include <string>
 #include <vector>
 #include <algorithm>
@@ -52,6 +51,7 @@ extern "C" {
 // parsers below.  Including it here (rather than relying on the includer to
 // pull it in first) makes this header self-contained and order-independent.
 #include "ViGEm/Common.h"
+#include "device_identity.h"
 
 #pragma comment(lib, "hid.lib")
 #pragma comment(lib, "setupapi.lib")
@@ -152,12 +152,6 @@ static inline bool HidValueCapsAppliesToReport(const HIDP_VALUE_CAPS& caps,
     // ReportID 0 means the collection has no numbered reports; in that case
     // buf[0] is payload and must not be treated as an ID.
     return caps.ReportID == 0 || caps.ReportID == reportId;
-}
-
-static inline bool HidDeviceInstanceIsViGEm(std::wstring instanceId) {
-    std::transform(instanceId.begin(), instanceId.end(), instanceId.begin(),
-                   [](wchar_t c) { return static_cast<wchar_t>(std::towupper(c)); });
-    return instanceId.find(L"VIGEMBUS") != std::wstring::npos;
 }
 
 // Convert a descriptor-defined hat value to XInput D-pad bits.  HID hats can
@@ -474,22 +468,6 @@ private:
     OVERLAPPED           readOv_       = {};
     bool                 readPending_  = false;
 
-    static bool IsViGEmDeviceTree(DEVINST device) {
-        DEVINST current = device;
-        for (int depth = 0; depth < 8; ++depth) {
-            wchar_t instanceId[MAX_DEVICE_ID_LEN] = {};
-            if (CM_Get_Device_IDW(current, instanceId, MAX_DEVICE_ID_LEN, 0) == CR_SUCCESS &&
-                HidDeviceInstanceIsViGEm(instanceId)) {
-                return true;
-            }
-
-            DEVINST parent = 0;
-            if (CM_Get_Parent(&parent, current, 0) != CR_SUCCESS) break;
-            current = parent;
-        }
-        return false;
-    }
-
     // ── Enumerate all HID gamepads/joysticks currently attached ──────────────
     // Uses HID usage page / usage to identify game controllers regardless of
     // vendor.  For known Sony VID/PIDs we accept the device even if the usage
@@ -529,7 +507,7 @@ private:
 
             // ViGEm's virtual DS4 deliberately exposes a genuine-looking Sony
             // HID interface. Only its parent chain identifies it as virtual.
-            if (IsViGEmDeviceTree(deviceInfo.DevInst)) continue;
+            if (HidDeviceTreeIsViGEm(deviceInfo.DevInst)) continue;
 
             std::wstring path = detail->DevicePath;
 

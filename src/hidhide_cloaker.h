@@ -30,6 +30,8 @@ extern "C" {
 #include <algorithm>
 #include <sstream>
 
+#include "device_identity.h"
+
 #pragma comment(lib, "cfgmgr32.lib")
 #pragma comment(lib, "hid.lib")
 #pragma comment(lib, "setupapi.lib")
@@ -254,6 +256,24 @@ public:
 
     bool IsApplied() const { return applied_; }
 
+    // Add controllers that appeared after the initial Apply() (USB replug,
+    // Bluetooth re-pair, or replacement pad). Entries are tracked so Restore()
+    // removes exactly what this process added.
+    int Refresh() {
+        if (!applied_) return 0;
+
+        auto bl = GetBlacklist();
+        int added = 0;
+        for (const auto& path : EnumerateHidGameControllers()) {
+            if (std::find(bl.begin(), bl.end(), path) != bl.end()) continue;
+            bl.push_back(path);
+            addedToBlacklist_.push_back(path);
+            ++added;
+        }
+        if (added != 0) SetBlacklist(bl);
+        return added;
+    }
+
 private:
     HANDLE                   hDevice_                 = INVALID_HANDLE_VALUE;
     bool                     applied_                 = false;
@@ -405,6 +425,10 @@ private:
 
             if (!SetupDiGetDeviceInterfaceDetailW(devInfo, &ifaceData, detail, needed, nullptr, &devInfoData))
                 continue;
+
+            // Do not globally hide virtual controllers created by this or
+            // another ViGEm client.
+            if (HidDeviceTreeIsViGEm(devInfoData.DevInst)) continue;
 
             // Try to open the device once — prefer read+write, fall back to
             // read-only.  A single open is enough for both attribute and

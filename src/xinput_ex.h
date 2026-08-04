@@ -31,6 +31,24 @@ inline DWORD XInputGetStateWithGuide(DWORD slot, XINPUT_STATE* state) {
     return XInputGetState(slot, state);
 }
 
+static inline uint8_t ConnectedXInputMask() {
+    uint8_t mask = 0;
+    for (DWORD slot = 0; slot < XUSER_MAX_COUNT; ++slot) {
+        XINPUT_STATE state = {};
+        if (XInputGetStateWithGuide(slot, &state) == ERROR_SUCCESS)
+            mask |= static_cast<uint8_t>(1u << slot);
+    }
+    return mask;
+}
+
+static inline bool IsVerifiedVirtualXInputSlot(DWORD candidate,
+                                               uint8_t beforeTarget,
+                                               uint8_t afterTarget) {
+    if (candidate >= XUSER_MAX_COUNT) return false;
+    const uint8_t bit = static_cast<uint8_t>(1u << candidate);
+    return (beforeTarget & bit) == 0 && (afterTarget & bit) != 0;
+}
+
 // Pick a connected physical slot without ever feeding this application's own
 // ViGEm X360 target back into itself. XUSER_MAX_COUNT is the "none" sentinel.
 static inline DWORD SelectPhysicalXInputSlot(DWORD preferredSlot,
