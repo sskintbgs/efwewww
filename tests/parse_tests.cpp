@@ -14,6 +14,7 @@
 #include "ds4_hid_reader.h"     // HidAxisToXInput, SonyReportOffsets, DS4HidReader::ParseSonyReport/GetSonyOffsets
 #include "report_builders.h"    // ConvertAxis, BuildX360Report, BuildDS4Report
 #include "hidhide_cloaker.h"    // HidHideComposeDosDevicePath
+#include "xinput_ex.h"           // SelectPhysicalXInputSlot
 
 static int g_pass = 0;
 static int g_fail = 0;
@@ -89,6 +90,18 @@ int main() {
                  "1-based hat value 8 -> up-left");
         check_eq(HidHatToXInputButtons(8, 0, 7), 0,
                  "zero-based hat out-of-range null value 8 -> centred");
+    }
+
+    std::printf("\n== Physical XInput slot selection ==\n");
+    {
+        check_eq(SelectPhysicalXInputSlot(0, 1, 0x03), 0,
+                 "preferred physical slot remains selected");
+        check_eq(SelectPhysicalXInputSlot(0, 0, 0x03), 1,
+                 "own virtual slot is skipped");
+        check_eq(SelectPhysicalXInputSlot(0, 0, 0x01), XUSER_MAX_COUNT,
+                 "own virtual pad is never accepted as the only input");
+        check_eq(SelectPhysicalXInputSlot(2, 3, 0x02), 1,
+                 "fallback finds another connected physical slot");
     }
 
     std::printf("\n== DS4 USB report parse ==\n");
