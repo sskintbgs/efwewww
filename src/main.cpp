@@ -22,37 +22,10 @@
 #include "hidhide_cloaker.h"
 #include "ds4_hid_reader.h"
 #include "report_builders.h"   // ConvertAxis / BuildX360Report / BuildDS4Report
+#include "xinput_ex.h"
 
 #pragma comment(lib, "winmm.lib")
 #pragma comment(lib, "xinput.lib")
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  XInputGetStateEx — undocumented ordinal #100 export from xinput1_3.dll.
-//  Identical to XInputGetState but does NOT mask the guide button bit
-//  (XUSB_GAMEPAD_GUIDE / 0x0400) out of XINPUT_GAMEPAD::wButtons.
-//  We load it manually so the app still links against xinput.lib normally.
-// ─────────────────────────────────────────────────────────────────────────────
-typedef DWORD(WINAPI* PFN_XInputGetStateEx)(DWORD, XINPUT_STATE*);
-static PFN_XInputGetStateEx g_XInputGetStateEx = nullptr;
-
-static void LoadXInputGetStateEx() {
-    // xinput1_3.dll is the only version that exposes ordinal 100.
-    HMODULE hXInput = LoadLibraryA("xinput1_3.dll");
-    if (hXInput) {
-        g_XInputGetStateEx = reinterpret_cast<PFN_XInputGetStateEx>(
-            GetProcAddress(hXInput, reinterpret_cast<LPCSTR>(100))
-        );
-    }
-    // Deliberately not freeing the module — we hold the reference for the
-    // lifetime of the process so the pointer stays valid.
-}
-
-// Wrapper: use the Ex variant if available, fall back to the normal one.
-static DWORD XInputGetStateWithGuide(DWORD slot, XINPUT_STATE* state) {
-    if (g_XInputGetStateEx) return g_XInputGetStateEx(slot, state);
-    return XInputGetState(slot, state);
-}
-
 
 static bool IsRunAsAdmin() {
     BOOL isAdmin = FALSE;
