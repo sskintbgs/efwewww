@@ -64,13 +64,21 @@ int main() {
               "ranged value cap contains interior axis usage");
         check(!HidValueCapsContainsUsage(ranged, 0x01, 0x39),
               "ranged value cap rejects unrelated hat usage");
+        ranged.ReportID = 2;
+        check(HidValueCapsAppliesToReport(ranged, 2),
+              "value cap applies to its report ID");
+        check(!HidValueCapsAppliesToReport(ranged, 1),
+              "value cap rejects a different report ID");
 
         HIDP_VALUE_CAPS single = {};
         single.UsagePage = 0x01;
         single.IsRange = FALSE;
         single.NotRange.Usage = 0x39;
+        single.ReportID = 0;
         check(HidValueCapsContainsUsage(single, 0x01, 0x39),
               "single value cap contains exact usage");
+        check(HidValueCapsAppliesToReport(single, 7),
+              "unnumbered value cap applies without reading buf[0] as an ID");
     }
 
     std::printf("\n== Generic HID hat normalization ==\n");
@@ -100,8 +108,18 @@ int main() {
                  "own virtual slot is skipped");
         check_eq(SelectPhysicalXInputSlot(0, 0, 0x01), XUSER_MAX_COUNT,
                  "own virtual pad is never accepted as the only input");
-        check_eq(SelectPhysicalXInputSlot(2, 3, 0x02), 1,
-                 "fallback finds another connected physical slot");
+        check_eq(SelectPhysicalXInputSlot(2, 3, 0x02), XUSER_MAX_COUNT,
+                 "disconnected preferred slot does not switch controllers");
+    }
+
+    std::printf("\n== ViGEm device ancestry detection ==\n");
+    {
+        check(HidDeviceInstanceIsViGEm(L"NEFARIUS\\VIGEMBUS\\GEN1"),
+              "modern ViGEmBus instance ID is virtual");
+        check(HidDeviceInstanceIsViGEm(L"ROOT\\VIGEMBUS\\0000"),
+              "legacy ViGEmBus instance ID is virtual");
+        check(!HidDeviceInstanceIsViGEm(L"USB\\VID_054C&PID_0CE6\\ABC"),
+              "physical USB controller instance is not ViGEm");
     }
 
     std::printf("\n== DS4 USB report parse ==\n");
