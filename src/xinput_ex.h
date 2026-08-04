@@ -8,6 +8,7 @@
 
 #include <windows.h>
 #include <xinput.h>
+#include <cstdint>
 
 typedef DWORD(WINAPI* PFN_XInputGetStateEx)(DWORD, XINPUT_STATE*);
 
@@ -28,4 +29,21 @@ inline void LoadXInputGetStateEx() {
 inline DWORD XInputGetStateWithGuide(DWORD slot, XINPUT_STATE* state) {
     if (g_XInputGetStateEx) return g_XInputGetStateEx(slot, state);
     return XInputGetState(slot, state);
+}
+
+// Pick a connected physical slot without ever feeding this application's own
+// ViGEm X360 target back into itself. XUSER_MAX_COUNT is the "none" sentinel.
+static inline DWORD SelectPhysicalXInputSlot(DWORD preferredSlot,
+                                             DWORD ownVirtualSlot,
+                                             uint8_t connectedMask) {
+    preferredSlot %= XUSER_MAX_COUNT;
+    auto available = [&](DWORD slot) {
+        return slot != ownVirtualSlot && (connectedMask & (1u << slot)) != 0;
+    };
+
+    if (available(preferredSlot)) return preferredSlot;
+    for (DWORD slot = 0; slot < XUSER_MAX_COUNT; ++slot) {
+        if (available(slot)) return slot;
+    }
+    return XUSER_MAX_COUNT;
 }

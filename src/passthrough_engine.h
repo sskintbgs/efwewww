@@ -135,6 +135,12 @@ private:
                          sizeof(state_.cloakMessage) - 1);
         }
 
+        // Select the physical raw-HID source before ViGEm creates a device that
+        // intentionally looks like a real controller. Otherwise a virtual DS4
+        // can win enumeration and the passthrough reads its own output.
+        DS4HidReader hidReader;
+        const bool useRawHid = hidReader.Open();
+
         ViGEmTargetImpl* target = vigem->CreateTarget(vtype, profile.vendorId, profile.productId);
         if (!target || !vigem->AddTarget(target)) {
             std::string err = "Could not create virtual controller: " + vigem->GetLastErrorText() +
@@ -145,43 +151,59 @@ private:
             return;
         }
 
+        DWORD ownVirtualXInputSlot = XUSER_MAX_COUNT;
+        if (!isDS4) {
+            vigem->GetX360UserIndex(target, ownVirtualXInputSlot);
+        }
+
         // Raise timer resolution + THIS worker thread's priority (not the whole
         // process, so the UI thread keeps running smoothly).
         timeBeginPeriod(1);
         const int oldPrio = GetThreadPriority(GetCurrentThread());
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
 
-        DS4HidReader hidReader;
-        bool useRawHid = hidReader.Open();
-
         XUSB_REPORT xOut;   XUSB_REPORT_INIT(&xOut);
         DS4_REPORT  ds4Out; DS4_REPORT_INIT(&ds4Out);
-        XINPUT_STATE xState;
 
         auto nextPoll   = std::chrono::steady_clock::now();
         auto startTime  = nextPoll;
         unsigned long long packets = 0, fails = 0;
+        bool sourceConnected = useRawHid && hidReader.IsOpen();
+        bool lastTx = false;
+        DWORD activeXInputSlot = slot_.load();
+        XINPUT_GAMEPAD lastGamepad{};
+        bool lastPsButton = false, lastTouchpad = false;
 
         while (!stop_.load(std::memory_order_relaxed)) {
             PhysicalGamepadState hidState;
-            bool hasInput = false;
+            bool hasPacket = false;
 
             if (useRawHid) {
-                hasInput = hidReader.Read(hidState);
-                if (!hasInput && !hidReader.IsOpen()) {
-                    useRawHid = hidReader.Open();   // device changed — rescan
+                if (!hidReader.IsOpen()) {
+                    // Reopen only the original physical interface; never switch
+                    // to the virtual target that now exists in the HID tree.
+                    hidReader.Open(true);
                 }
-            }
-            if (!useRawHid) {
-                ZeroMemory(&xState, sizeof(xState));
-                hasInput = (XInputGetStateWithGuide(slot_.load(), &xState) == ERROR_SUCCESS);
+                if (hidReader.IsOpen()) hasPacket = hidReader.Read(hidState);
+                sourceConnected = hidReader.IsOpen();
+            } else {
+                XINPUT_STATE states[XUSER_MAX_COUNT] = {};
+                uint8_t connectedMask = 0;
+                for (DWORD candidate = 0; candidate < XUSER_MAX_COUNT; ++candidate) {
+                    if (XInputGetStateWithGuide(candidate, &states[candidate]) == ERROR_SUCCESS)
+                        connectedMask |= static_cast<uint8_t>(1u << candidate);
+                }
+
+                activeXInputSlot = SelectPhysicalXInputSlot(
+                    slot_.load(), ownVirtualXInputSlot, connectedMask);
+                sourceConnected = activeXInputSlot < XUSER_MAX_COUNT;
+                hasPacket = sourceConnected;
+                if (sourceConnected) lastGamepad = states[activeXInputSlot].Gamepad;
             }
 
-            bool lastTx = false;
-            bool psButton = false, touchpad = false;
-            XINPUT_GAMEPAD gp{};
-
-            if (hasInput) {
+            if (hasPacket) {
+                bool psButton = false, touchpad = false;
+                XINPUT_GAMEPAD gp{};
                 if (useRawHid) {
                     gp.sThumbLX      = hidState.leftX;
                     gp.sThumbLY      = hidState.leftY;
@@ -193,7 +215,7 @@ private:
                     psButton         = hidState.psButton;
                     touchpad         = hidState.touchpad;
                 } else {
-                    gp       = xState.Gamepad;
+                    gp       = lastGamepad;
                     psButton = (gp.wButtons & XUSB_GAMEPAD_GUIDE) != 0;
                 }
 
@@ -208,6 +230,9 @@ private:
                     lastTx = vigem->UpdateX360(target, xOut);
                     gp = gx;
                 }
+                lastGamepad = gp;
+                lastPsButton = psButton;
+                lastTouchpad = touchpad;
                 ++packets;
                 if (!lastTx) ++fails;
             }
@@ -217,19 +242,21 @@ private:
                 double elapsed = std::chrono::duration<double>(now - startTime).count();
                 std::lock_guard<std::mutex> l(mtx_);
                 state_.running      = true;
-                state_.hasInput     = hasInput;
+                state_.hasInput     = sourceConnected;
                 state_.lastTx       = lastTx;
                 state_.packets      = packets;
                 state_.fails        = fails;
                 state_.hz           = elapsed > 0 ? packets / elapsed : 0.0;
-                state_.gamepad      = gp;
-                state_.psButton     = psButton;
-                state_.touchpad     = touchpad;
+                state_.gamepad      = lastGamepad;
+                state_.psButton     = lastPsButton;
+                state_.touchpad     = lastTouchpad;
                 state_.cloakApplied = cloaker.IsApplied();
                 state_.cloakCount   = cloakResult.devicesCloaked;
-                state_.xinputSlot   = slot_.load();
+                state_.xinputSlot   = useRawHid ? slot_.load() : activeXInputSlot;
                 state_.usingRawHid  = useRawHid;
-                const char* src = useRawHid ? hidReader.DeviceName() : "XInput (no HID gamepad)";
+                const char* src = useRawHid
+                    ? (hidReader.DeviceName() ? hidReader.DeviceName() : "Raw HID (reconnecting)")
+                    : (sourceConnected ? "XInput" : "XInput (waiting for physical controller)");
                 std::strncpy(state_.inputSource, src ? src : "-", sizeof(state_.inputSource) - 1);
             }
 

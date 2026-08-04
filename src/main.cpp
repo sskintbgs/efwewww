@@ -238,6 +238,14 @@ static void RunPassthrough(ViGEmLoader& vigem, const ControllerSpoofProfile& pro
         }
     }
 
+    // Capture the physical HID interface before the virtual target exists, so
+    // a ViGEm DS4 cannot be selected as this passthrough's own input.
+    DS4HidReader hidReader;
+    const bool useRawHid = hidReader.Open();
+    const char* inputSource = useRawHid
+        ? hidReader.DeviceName()
+        : "XInput (waiting for physical controller)";
+
     ViGEmTargetImpl* target = vigem.CreateTarget(vtype, profile.vendorId, profile.productId);
     if (!target || !vigem.AddTarget(target)) {
         std::cout << "\n [ERROR] Could not create virtual controller: "
@@ -248,6 +256,11 @@ static void RunPassthrough(ViGEmLoader& vigem, const ControllerSpoofProfile& pro
         // cloaker destructor restores HidHide state automatically
         _getch();
         return;
+    }
+
+    DWORD ownVirtualXInputSlot = XUSER_MAX_COUNT;
+    if (!isDS4) {
+        vigem.GetX360UserIndex(target, ownVirtualXInputSlot);
     }
 
     // Raise timer resolution and both process + thread priority for the
@@ -271,18 +284,10 @@ static void RunPassthrough(ViGEmLoader& vigem, const ControllerSpoofProfile& pro
 
     XUSB_REPORT xOut;   XUSB_REPORT_INIT(&xOut);
     DS4_REPORT  ds4Out; DS4_REPORT_INIT(&ds4Out);
-    XINPUT_STATE xState;
     bool lastTx = false;
-
-    // Try to open the physical controller as a raw HID device first.
-    // This now detects ANY HID gamepad/joystick (not just Sony devices),
-    // including controllers that are hidden by HidHide but accessible because
-    // this process is whitelisted.  Falls back to XInput if nothing found.
-    DS4HidReader hidReader;
-    bool useRawHid = hidReader.Open();
-    const char* inputSource = useRawHid
-        ? hidReader.DeviceName()
-        : "XInput (no HID gamepad found)";
+    bool sourceConnected = useRawHid && hidReader.IsOpen();
+    DWORD activeXInputSlot = g_xinputSlot.load();
+    XINPUT_GAMEPAD lastGamepad{};
 
     ClearScreen();
 
@@ -300,28 +305,36 @@ static void RunPassthrough(ViGEmLoader& vigem, const ControllerSpoofProfile& pro
 
         // Poll physical controller — raw HID path for DS4/DualSense,
         // XInput path for everything else.
-        bool hasInput = false;
+        bool hasPacket = false;
         PhysicalGamepadState hidState;
 
         if (useRawHid) {
-            hasInput = hidReader.Read(hidState);
-            if (!hasInput && !hidReader.IsOpen()) {
-                // Device was disconnected — try to reopen next tick.
-                // Open() scans all HID gamepads again, so a different
-                // controller plugged in will be picked up automatically.
-                useRawHid = hidReader.Open();
-                inputSource = useRawHid ? hidReader.DeviceName() : "XInput (no HID gamepad found)";
+            if (!hidReader.IsOpen()) hidReader.Open(true);
+            if (hidReader.IsOpen()) hasPacket = hidReader.Read(hidState);
+            sourceConnected = hidReader.IsOpen();
+            inputSource = hidReader.DeviceName()
+                ? hidReader.DeviceName()
+                : "Raw HID (reconnecting)";
+        } else {
+            XINPUT_STATE states[XUSER_MAX_COUNT] = {};
+            uint8_t connectedMask = 0;
+            for (DWORD candidate = 0; candidate < XUSER_MAX_COUNT; ++candidate) {
+                if (XInputGetStateWithGuide(candidate, &states[candidate]) == ERROR_SUCCESS)
+                    connectedMask |= static_cast<uint8_t>(1u << candidate);
             }
-        }
 
-        if (!useRawHid) {
-            ZeroMemory(&xState, sizeof(xState));
-            hasInput = (XInputGetStateWithGuide(g_xinputSlot.load(), &xState) == ERROR_SUCCESS);
+            activeXInputSlot = SelectPhysicalXInputSlot(
+                g_xinputSlot.load(), ownVirtualXInputSlot, connectedMask);
+            sourceConnected = activeXInputSlot < XUSER_MAX_COUNT;
+            hasPacket = sourceConnected;
+            if (sourceConnected) lastGamepad = states[activeXInputSlot].Gamepad;
+            inputSource = sourceConnected
+                ? "XInput"
+                : "XInput (waiting for physical controller)";
         }
         polls++;
 
-        lastTx = false;
-        if (hasInput) {
+        if (hasPacket) {
             // Unify into an XINPUT_GAMEPAD-shaped struct plus the two DS4-only
             // buttons (PS home + touchpad click) that have no XInput bit, so we
             // can forward them without clobbering Share/Back.
@@ -339,7 +352,7 @@ static void RunPassthrough(ViGEmLoader& vigem, const ControllerSpoofProfile& pro
                 psButton         = hidState.psButton;
                 touchpad         = hidState.touchpad;
             } else {
-                gp       = xState.Gamepad;
+                gp       = lastGamepad;
                 psButton = (gp.wButtons & XUSB_GAMEPAD_GUIDE) != 0;   // Guide/Home → PS
             }
 
@@ -359,9 +372,7 @@ static void RunPassthrough(ViGEmLoader& vigem, const ControllerSpoofProfile& pro
             }
             packets++;
             if (!lastTx) fails++;
-
-            // Mirror into snapshot for dashboard (always an XINPUT_GAMEPAD shape now).
-            xState.Gamepad = gp;
+            lastGamepad = gp;
         }
 
         // Publish a snapshot for the dashboard thread. This is just an
@@ -372,16 +383,16 @@ static void RunPassthrough(ViGEmLoader& vigem, const ControllerSpoofProfile& pro
             auto now = std::chrono::steady_clock::now();
             double elapsed = std::chrono::duration<double>(now - startTime).count();
             std::lock_guard<std::mutex> lock(g_dashMutex);
-            g_dashSnapshot.hasInput     = hasInput;
+            g_dashSnapshot.hasInput     = sourceConnected;
             g_dashSnapshot.lastTx       = lastTx;
             g_dashSnapshot.packets      = packets;
             g_dashSnapshot.fails        = fails;
             g_dashSnapshot.hz           = elapsed > 0 ? packets / elapsed : 0.0;
             g_dashSnapshot.cloakApplied = cloaker.IsApplied();
             g_dashSnapshot.cloakCount   = cloakResult.devicesCloaked;
-            g_dashSnapshot.xinputSlot   = g_xinputSlot.load();
+            g_dashSnapshot.xinputSlot   = useRawHid ? g_xinputSlot.load() : activeXInputSlot;
             g_dashSnapshot.inputSource  = inputSource;
-            if (hasInput) g_dashSnapshot.gamepad = xState.Gamepad;
+            g_dashSnapshot.gamepad      = lastGamepad;
         }
 
         nextPoll += pollInterval;

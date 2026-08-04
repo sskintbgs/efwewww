@@ -2,6 +2,7 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <xinput.h>
 #include <cstdint>
 #include <iomanip>
 #include <iostream>
@@ -130,6 +131,20 @@ public:
 
         wrapper->attached = true;
         wrapper->serialNo = vigem_target_get_index(wrapper->target);
+        return true;
+    }
+
+    bool GetX360UserIndex(ViGEmTargetImpl* wrapper, DWORD& index) {
+        if (!isLoaded || !client || !wrapper || !wrapper->target ||
+            !wrapper->attached || wrapper->type != Xbox360Wired) {
+            lastError = VIGEM_ERROR_INVALID_TARGET;
+            return false;
+        }
+
+        ULONG userIndex = XUSER_MAX_COUNT;
+        lastError = vigem_target_x360_get_user_index(client, wrapper->target, &userIndex);
+        if (!VIGEM_SUCCESS(lastError)) return false;
+        index = static_cast<DWORD>(userIndex);
         return true;
     }
 

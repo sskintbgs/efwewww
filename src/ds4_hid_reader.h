@@ -196,21 +196,37 @@ public:
     const char* DeviceName() const { return deviceName_; }
     bool        IsOpen()     const { return hDev_ != INVALID_HANDLE_VALUE; }
 
-    // Scan all HID devices and open the first HID gamepad or joystick found.
-    // Prefers Sony devices (structured DS4 parse) but accepts any gamepad.
+    // Scan all HID devices and open a gamepad or joystick. When
+    // preferPreviousDevice is true, only the previously selected interface is
+    // accepted; this prevents a newly-created virtual DS4 from becoming its own
+    // input source while a physical controller is reconnecting.
     // Returns true if a supported device was found and opened.
-    bool Open() {
+    bool Open(bool preferPreviousDevice = false) {
+        const std::wstring previousPath = devicePath_;
         Close();
 
         auto candidates = EnumerateCandidates();
         if (candidates.empty()) return false;
 
-        // Prefer Sony devices so we get the richest parse; fall back to any.
         HidGamepadCandidate* chosen = nullptr;
-        for (auto& c : candidates) {
-            if (c.isSony) { chosen = &c; break; }
+        if (preferPreviousDevice && !previousPath.empty()) {
+            for (auto& c : candidates) {
+                if (c.devicePath == previousPath) {
+                    chosen = &c;
+                    break;
+                }
+            }
+            if (!chosen) {
+                devicePath_ = previousPath;
+                return false;
+            }
+        } else {
+            // Prefer Sony devices so we get the richest parse; fall back to any.
+            for (auto& c : candidates) {
+                if (c.isSony) { chosen = &c; break; }
+            }
+            if (!chosen) chosen = &candidates[0];
         }
-        if (!chosen) chosen = &candidates[0];
 
         // Try read+write first (needed to send output reports), fall back to
         // read-only. HidHide-hidden devices that whitelist this process will
@@ -239,6 +255,7 @@ public:
         isSony_     = chosen->isSony;
         sonyType_   = chosen->sonyType;
         deviceName_ = chosen->friendlyName;
+        devicePath_ = chosen->devicePath;
         hEvent_     = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         if (!hEvent_) {
             Close();
@@ -447,6 +464,7 @@ private:
     HANDLE               hDev_       = INVALID_HANDLE_VALUE;
     HANDLE               hEvent_     = nullptr;
     const char*          deviceName_ = nullptr;
+    std::wstring         devicePath_;
     bool                 isSony_     = false;
     SonyDeviceType       sonyType_   = SonyDeviceType::DS4;
     PHIDP_PREPARSED_DATA ppd_        = nullptr;
