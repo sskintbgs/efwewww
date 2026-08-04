@@ -232,8 +232,22 @@ static void RunPassthrough(ViGEmLoader& vigem, const ControllerSpoofProfile& pro
     }
 
     DWORD ownVirtualXInputSlot = XUSER_MAX_COUNT;
-    if (!isDS4) {
-        vigem.GetX360UserIndex(target, ownVirtualXInputSlot);
+    if (!isDS4 && !useRawHid) {
+        for (int attempt = 0; attempt < 50 && ownVirtualXInputSlot >= XUSER_MAX_COUNT; ++attempt) {
+            DWORD index = XUSER_MAX_COUNT;
+            if (vigem.GetX360UserIndex(target, index) && index < XUSER_MAX_COUNT)
+                ownVirtualXInputSlot = index;
+            else
+                Sleep(10);
+        }
+        if (ownVirtualXInputSlot >= XUSER_MAX_COUNT) {
+            std::cout << "\n [ERROR] Could not identify the virtual XInput slot."
+                      << "\n Forwarding was stopped to prevent an input feedback loop."
+                      << "\n Press any key to return...\n";
+            vigem.RemoveTarget(target);
+            _getch();
+            return;
+        }
     }
 
     // Raise timer resolution and both process + thread priority for the
@@ -261,6 +275,8 @@ static void RunPassthrough(ViGEmLoader& vigem, const ControllerSpoofProfile& pro
     bool sourceConnected = useRawHid && hidReader.IsOpen();
     DWORD activeXInputSlot = g_xinputSlot.load();
     XINPUT_GAMEPAD lastGamepad{};
+    bool wasConnected = sourceConnected;
+    auto nextHidReconnect = std::chrono::steady_clock::now();
 
     ClearScreen();
 
@@ -282,7 +298,11 @@ static void RunPassthrough(ViGEmLoader& vigem, const ControllerSpoofProfile& pro
         PhysicalGamepadState hidState;
 
         if (useRawHid) {
-            if (!hidReader.IsOpen()) hidReader.Open(true);
+            auto now = std::chrono::steady_clock::now();
+            if (!hidReader.IsOpen() && now >= nextHidReconnect) {
+                hidReader.Open();
+                nextHidReconnect = now + std::chrono::milliseconds(500);
+            }
             if (hidReader.IsOpen()) hasPacket = hidReader.Read(hidState);
             sourceConnected = hidReader.IsOpen();
             inputSource = hidReader.DeviceName()
@@ -347,6 +367,20 @@ static void RunPassthrough(ViGEmLoader& vigem, const ControllerSpoofProfile& pro
             if (!lastTx) fails++;
             lastGamepad = gp;
         }
+
+        if (wasConnected && !sourceConnected) {
+            lastGamepad = {};
+            if (isDS4) {
+                BuildDS4Report(lastGamepad, ds4Out);
+                lastTx = vigem.UpdateDS4(target, ds4Out);
+            } else {
+                BuildX360Report(lastGamepad, xOut);
+                lastTx = vigem.UpdateX360(target, xOut);
+            }
+            packets++;
+            if (!lastTx) fails++;
+        }
+        wasConnected = sourceConnected;
 
         // Publish a snapshot for the dashboard thread. This is just an
         // uncontended mutex lock + POD copy (no I/O), so it costs on the

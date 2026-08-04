@@ -42,8 +42,5 @@ static inline DWORD SelectPhysicalXInputSlot(DWORD preferredSlot,
     };
 
     if (available(preferredSlot)) return preferredSlot;
-    for (DWORD slot = 0; slot < XUSER_MAX_COUNT; ++slot) {
-        if (available(slot)) return slot;
-    }
     return XUSER_MAX_COUNT;
 }

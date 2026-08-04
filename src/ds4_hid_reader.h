@@ -40,8 +40,10 @@ extern "C" {
 }
 #include <setupapi.h>
 #include <devguid.h>
+#include <cfgmgr32.h>
 #include <cstdint>
 #include <cstdio>
+#include <cwctype>
 #include <string>
 #include <vector>
 #include <algorithm>
@@ -53,6 +55,7 @@ extern "C" {
 
 #pragma comment(lib, "hid.lib")
 #pragma comment(lib, "setupapi.lib")
+#pragma comment(lib, "cfgmgr32.lib")
 
 // ── Normalised gamepad state ──────────────────────────────────────────────────
 // Axes: -32768..32767 matching XINPUT_GAMEPAD conventions.
@@ -144,6 +147,19 @@ static inline bool HidValueCapsContainsUsage(const HIDP_VALUE_CAPS& caps,
     return caps.NotRange.Usage == usage;
 }
 
+static inline bool HidValueCapsAppliesToReport(const HIDP_VALUE_CAPS& caps,
+                                               uint8_t reportId) {
+    // ReportID 0 means the collection has no numbered reports; in that case
+    // buf[0] is payload and must not be treated as an ID.
+    return caps.ReportID == 0 || caps.ReportID == reportId;
+}
+
+static inline bool HidDeviceInstanceIsViGEm(std::wstring instanceId) {
+    std::transform(instanceId.begin(), instanceId.end(), instanceId.begin(),
+                   [](wchar_t c) { return static_cast<wchar_t>(std::towupper(c)); });
+    return instanceId.find(L"VIGEMBUS") != std::wstring::npos;
+}
+
 // Convert a descriptor-defined hat value to XInput D-pad bits.  HID hats can
 // be zero-based (0..7, null=8) or one-based (1..8, null=0), so the raw value
 // must be normalised by LogicalMin before applying the direction mapping.
@@ -196,37 +212,21 @@ public:
     const char* DeviceName() const { return deviceName_; }
     bool        IsOpen()     const { return hDev_ != INVALID_HANDLE_VALUE; }
 
-    // Scan all HID devices and open a gamepad or joystick. When
-    // preferPreviousDevice is true, only the previously selected interface is
-    // accepted; this prevents a newly-created virtual DS4 from becoming its own
-    // input source while a physical controller is reconnecting.
+    // Scan all HID devices and open a physical gamepad or joystick.
+    // ViGEm descendants are excluded by their device ancestry.
     // Returns true if a supported device was found and opened.
-    bool Open(bool preferPreviousDevice = false) {
-        const std::wstring previousPath = devicePath_;
+    bool Open() {
         Close();
 
         auto candidates = EnumerateCandidates();
         if (candidates.empty()) return false;
 
+        // Prefer Sony devices so we get the richest parse; fall back to any.
         HidGamepadCandidate* chosen = nullptr;
-        if (preferPreviousDevice && !previousPath.empty()) {
-            for (auto& c : candidates) {
-                if (c.devicePath == previousPath) {
-                    chosen = &c;
-                    break;
-                }
-            }
-            if (!chosen) {
-                devicePath_ = previousPath;
-                return false;
-            }
-        } else {
-            // Prefer Sony devices so we get the richest parse; fall back to any.
-            for (auto& c : candidates) {
-                if (c.isSony) { chosen = &c; break; }
-            }
-            if (!chosen) chosen = &candidates[0];
+        for (auto& c : candidates) {
+            if (c.isSony) { chosen = &c; break; }
         }
+        if (!chosen) chosen = &candidates[0];
 
         // Try read+write first (needed to send output reports), fall back to
         // read-only. HidHide-hidden devices that whitelist this process will
@@ -255,7 +255,6 @@ public:
         isSony_     = chosen->isSony;
         sonyType_   = chosen->sonyType;
         deviceName_ = chosen->friendlyName;
-        devicePath_ = chosen->devicePath;
         hEvent_     = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         if (!hEvent_) {
             Close();
@@ -464,7 +463,6 @@ private:
     HANDLE               hDev_       = INVALID_HANDLE_VALUE;
     HANDLE               hEvent_     = nullptr;
     const char*          deviceName_ = nullptr;
-    std::wstring         devicePath_;
     bool                 isSony_     = false;
     SonyDeviceType       sonyType_   = SonyDeviceType::DS4;
     PHIDP_PREPARSED_DATA ppd_        = nullptr;
@@ -475,6 +473,22 @@ private:
     uint8_t              readBuf_[256] = {};
     OVERLAPPED           readOv_       = {};
     bool                 readPending_  = false;
+
+    static bool IsViGEmDeviceTree(DEVINST device) {
+        DEVINST current = device;
+        for (int depth = 0; depth < 8; ++depth) {
+            wchar_t instanceId[MAX_DEVICE_ID_LEN] = {};
+            if (CM_Get_Device_IDW(current, instanceId, MAX_DEVICE_ID_LEN, 0) == CR_SUCCESS &&
+                HidDeviceInstanceIsViGEm(instanceId)) {
+                return true;
+            }
+
+            DEVINST parent = 0;
+            if (CM_Get_Parent(&parent, current, 0) != CR_SUCCESS) break;
+            current = parent;
+        }
+        return false;
+    }
 
     // ── Enumerate all HID gamepads/joysticks currently attached ──────────────
     // Uses HID usage page / usage to identify game controllers regardless of
@@ -507,8 +521,15 @@ private:
             std::vector<BYTE> detailBuf(needed);
             auto* detail = reinterpret_cast<SP_DEVICE_INTERFACE_DETAIL_DATA_W*>(detailBuf.data());
             detail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
-            if (!SetupDiGetDeviceInterfaceDetailW(devInfo, &ifaceData, detail, needed, nullptr, nullptr))
+            SP_DEVINFO_DATA deviceInfo = {};
+            deviceInfo.cbSize = sizeof(deviceInfo);
+            if (!SetupDiGetDeviceInterfaceDetailW(
+                    devInfo, &ifaceData, detail, needed, nullptr, &deviceInfo))
                 continue;
+
+            // ViGEm's virtual DS4 deliberately exposes a genuine-looking Sony
+            // HID interface. Only its parent chain identifies it as virtual.
+            if (IsViGEmDeviceTree(deviceInfo.DevInst)) continue;
 
             std::wstring path = detail->DevicePath;
 
@@ -649,7 +670,8 @@ private:
             // hot path does no per-poll re-query or heap allocation.
             LONG logMin = 0, logMax = 255;
             for (const auto& vc : valueCaps_) {
-                if (HidValueCapsContainsUsage(vc, 0x01, am.usage)) {
+                if (HidValueCapsContainsUsage(vc, 0x01, am.usage) &&
+                    HidValueCapsAppliesToReport(vc, buf[0])) {
                     logMin = vc.LogicalMin;
                     logMax = vc.LogicalMax;
                     break;
@@ -696,7 +718,8 @@ private:
             if (st == HIDP_STATUS_SUCCESS) {
                 LONG logMin = 0, logMax = 7;
                 for (const auto& vc : valueCaps_) {
-                    if (HidValueCapsContainsUsage(vc, 0x01, 0x39)) {
+                    if (HidValueCapsContainsUsage(vc, 0x01, 0x39) &&
+                        HidValueCapsAppliesToReport(vc, buf[0])) {
                         logMin = vc.LogicalMin;
                         logMax = vc.LogicalMax;
                         break;

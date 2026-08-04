@@ -152,8 +152,22 @@ private:
         }
 
         DWORD ownVirtualXInputSlot = XUSER_MAX_COUNT;
-        if (!isDS4) {
-            vigem->GetX360UserIndex(target, ownVirtualXInputSlot);
+        if (!isDS4 && !useRawHid) {
+            // The XUSB PDO can take a moment to acquire its XInput user index.
+            // Never poll XInput until our own slot is known unequivocally.
+            for (int attempt = 0; attempt < 50 && ownVirtualXInputSlot >= XUSER_MAX_COUNT; ++attempt) {
+                DWORD index = XUSER_MAX_COUNT;
+                if (vigem->GetX360UserIndex(target, index) && index < XUSER_MAX_COUNT)
+                    ownVirtualXInputSlot = index;
+                else
+                    Sleep(10);
+            }
+            if (ownVirtualXInputSlot >= XUSER_MAX_COUNT) {
+                publishError("Could not identify the virtual XInput slot; forwarding was stopped to prevent an input feedback loop.");
+                vigem->RemoveTarget(target);
+                running_.store(false);
+                return;
+            }
         }
 
         // Raise timer resolution + THIS worker thread's priority (not the whole
@@ -173,16 +187,20 @@ private:
         DWORD activeXInputSlot = slot_.load();
         XINPUT_GAMEPAD lastGamepad{};
         bool lastPsButton = false, lastTouchpad = false;
+        bool wasConnected = sourceConnected;
+        auto nextHidReconnect = std::chrono::steady_clock::now();
 
         while (!stop_.load(std::memory_order_relaxed)) {
             PhysicalGamepadState hidState;
             bool hasPacket = false;
 
             if (useRawHid) {
-                if (!hidReader.IsOpen()) {
-                    // Reopen only the original physical interface; never switch
-                    // to the virtual target that now exists in the HID tree.
-                    hidReader.Open(true);
+                auto now = std::chrono::steady_clock::now();
+                if (!hidReader.IsOpen() && now >= nextHidReconnect) {
+                    // ViGEm descendants are filtered during enumeration, so a
+                    // replugged/re-paired physical controller can be selected.
+                    hidReader.Open();
+                    nextHidReconnect = now + std::chrono::milliseconds(500);
                 }
                 if (hidReader.IsOpen()) hasPacket = hidReader.Read(hidState);
                 sourceConnected = hidReader.IsOpen();
@@ -236,6 +254,24 @@ private:
                 ++packets;
                 if (!lastTx) ++fails;
             }
+
+            if (wasConnected && !sourceConnected) {
+                // ViGEm retains the last report indefinitely. Send one neutral
+                // frame on a real disconnect so buttons/sticks cannot stay held.
+                lastGamepad = {};
+                lastPsButton = false;
+                lastTouchpad = false;
+                if (isDS4) {
+                    BuildDS4Report(lastGamepad, ds4Out);
+                    lastTx = vigem->UpdateDS4(target, ds4Out);
+                } else {
+                    BuildX360Report(lastGamepad, xOut);
+                    lastTx = vigem->UpdateX360(target, xOut);
+                }
+                ++packets;
+                if (!lastTx) ++fails;
+            }
+            wasConnected = sourceConnected;
 
             {
                 auto now = std::chrono::steady_clock::now();
