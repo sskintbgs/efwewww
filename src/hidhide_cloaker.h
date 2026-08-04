@@ -88,12 +88,17 @@ static std::vector<std::wstring> ParseMultiSz(const std::vector<BYTE>& buf) {
 // Serialize a vector of wstrings back into a double-null-terminated block.
 static std::vector<BYTE> SerializeMultiSz(const std::vector<std::wstring>& v) {
     std::vector<BYTE> out;
+    if (v.empty()) {
+        // Empty MULTI_SZ is two complete wide null terminators.
+        out.resize(2 * sizeof(wchar_t), 0);
+        return out;
+    }
     for (const auto& s : v) {
         const BYTE* raw = reinterpret_cast<const BYTE*>(s.c_str());
         out.insert(out.end(), raw, raw + (s.size() + 1) * sizeof(wchar_t));
     }
-    // Trailing null terminator.
-    out.push_back(0); out.push_back(0);
+    // One extra wide null after the null already included with the last string.
+    out.resize(out.size() + sizeof(wchar_t), 0);
     return out;
 }
 
@@ -164,6 +169,7 @@ public:
         if (!activeRead || !whitelistRead || !blacklistRead) {
             r.statusMessage =
                 "HidHide configuration could not be read; skipping cloaking to preserve the existing whitelist and device blacklist.";
+            Restore();
             return r;
         }
 
@@ -195,7 +201,8 @@ public:
             ss << "HidHide present but this app could not be whitelisted; skipping "
                << "cloaking so the controller stays readable by this app.";
             r.statusMessage = ss.str();
-            return r;   // Restore() still cleans up the whitelist entry we tried.
+            Restore();
+            return r;
         }
 
         // ── 3. Cloak physical HID game controllers ────────────────────────
@@ -215,6 +222,7 @@ public:
             if (!SetBlacklist(bl)) {
                 r.statusMessage =
                     "HidHide rejected the updated device blacklist; continuing without changing cloaking.";
+                Restore();
                 return r;
             }
             addedToBlacklist_.insert(
@@ -223,12 +231,15 @@ public:
         }
 
         // ── 4. Enable cloaking ────────────────────────────────────────────
+        // Mark restoration as required before issuing the mutation because a
+        // failed IOCTL can still have partially changed driver state.
+        applied_ = true;
         if (!SetActive(true)) {
             r.statusMessage =
                 "HidHide rejected the request to enable cloaking; prior configuration will be restored.";
+            Restore();
             return r;
         }
-        applied_ = true;
 
         std::ostringstream ss;
         ss << "HidHide cloaking active.\n"
@@ -249,20 +260,28 @@ public:
             return;
         }
 
-        // Remove entries we added to the blacklist.
-        if (!addedToBlacklist_.empty()) {
+        bool cleanupOk = true;
+
+        // Remove entries we added to the blacklist. Transient driver errors
+        // are retried; an unreadable list is never replaced with an empty one.
+        for (int attempt = 0; !addedToBlacklist_.empty() && attempt < 3; ++attempt) {
             bool blacklistRead = false;
             auto bl = GetBlacklist(&blacklistRead);
             if (blacklistRead) {
                 for (const auto& path : addedToBlacklist_) {
                     bl.erase(std::remove(bl.begin(), bl.end(), path), bl.end());
                 }
-                if (SetBlacklist(bl)) addedToBlacklist_.clear();
+                if (SetBlacklist(bl)) {
+                    addedToBlacklist_.clear();
+                    break;
+                }
             }
+            Sleep(10);
         }
+        if (!addedToBlacklist_.empty()) cleanupOk = false;
 
         // Remove this exe from the whitelist if we added it.
-        if (ownExeAddedToWhitelist_) {
+        for (int attempt = 0; ownExeAddedToWhitelist_ && attempt < 3; ++attempt) {
             std::wstring exePath = GetOwnExePath();
             bool whitelistRead = false;
             auto wl = GetWhitelist(&whitelistRead);
@@ -270,10 +289,23 @@ public:
                 wl.erase(std::remove(wl.begin(), wl.end(), exePath), wl.end());
                 if (SetWhitelist(wl)) ownExeAddedToWhitelist_ = false;
             }
+            if (ownExeAddedToWhitelist_) Sleep(10);
         }
+        if (ownExeAddedToWhitelist_) cleanupOk = false;
 
         // Restore the active flag to whatever it was before.
-        SetActive(savedActive_);
+        bool activeRestored = false;
+        for (int attempt = 0; attempt < 3 && !activeRestored; ++attempt) {
+            activeRestored = SetActive(savedActive_);
+            if (!activeRestored) Sleep(10);
+        }
+        if (!activeRestored) cleanupOk = false;
+
+        if (!cleanupOk) {
+            OutputDebugStringA(
+                "ControllerPassthrough: HidHide cleanup failed after 3 attempts; "
+                "open HidHide Configuration Client and verify its application/device lists.\n");
+        }
 
         applied_ = false;
         CloseHandle(hDevice_);
