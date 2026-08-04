@@ -154,10 +154,18 @@ public:
         r.hidhideAvailable = true;
 
         // ── 1. Save current state ──────────────────────────────────────────
-        savedActive_    = GetActive();
-        savedWhitelist_ = GetWhitelist();
-        savedBlacklist_ = GetBlacklist();
+        bool activeRead = false;
+        bool whitelistRead = false;
+        bool blacklistRead = false;
+        savedActive_    = GetActive(&activeRead);
+        savedWhitelist_ = GetWhitelist(&whitelistRead);
+        savedBlacklist_ = GetBlacklist(&blacklistRead);
         r.wasAlreadyActive = savedActive_;
+        if (!activeRead || !whitelistRead || !blacklistRead) {
+            r.statusMessage =
+                "HidHide configuration could not be read; skipping cloaking to preserve the existing whitelist and device blacklist.";
+            return r;
+        }
 
         // ── 2. Whitelist this executable ──────────────────────────────────
         std::wstring exePath = GetOwnExePath();
@@ -169,9 +177,8 @@ public:
                 whitelisted = true;
             } else {
                 wl.push_back(exePath);
-                SetWhitelist(wl);
-                ownExeAddedToWhitelist_ = true;
-                r.whitelistAdded = true;
+                ownExeAddedToWhitelist_ = SetWhitelist(wl);
+                r.whitelistAdded = ownExeAddedToWhitelist_;
                 // Verify the entry actually took: a wrong path format or an
                 // access failure would otherwise silently lock THIS process out
                 // of any device we then cloak.
@@ -195,21 +202,32 @@ public:
         auto physicalPaths = EnumerateHidGameControllers();
         auto bl = savedBlacklist_;
 
+        std::vector<std::wstring> newlyAdded;
         for (const auto& path : physicalPaths) {
             bool already = std::find(bl.begin(), bl.end(), path) != bl.end();
             if (!already) {
                 bl.push_back(path);
-                addedToBlacklist_.push_back(path);
-                r.devicesCloaked++;
+                newlyAdded.push_back(path);
             }
         }
 
-        if (!addedToBlacklist_.empty()) {
-            SetBlacklist(bl);
+        if (!newlyAdded.empty()) {
+            if (!SetBlacklist(bl)) {
+                r.statusMessage =
+                    "HidHide rejected the updated device blacklist; continuing without changing cloaking.";
+                return r;
+            }
+            addedToBlacklist_.insert(
+                addedToBlacklist_.end(), newlyAdded.begin(), newlyAdded.end());
+            r.devicesCloaked = static_cast<int>(newlyAdded.size());
         }
 
         // ── 4. Enable cloaking ────────────────────────────────────────────
-        SetActive(true);
+        if (!SetActive(true)) {
+            r.statusMessage =
+                "HidHide rejected the request to enable cloaking; prior configuration will be restored.";
+            return r;
+        }
         applied_ = true;
 
         std::ostringstream ss;
@@ -225,25 +243,33 @@ public:
     // fail-safe path, so that entry is still cleaned up.
     void Restore() {
         if (hDevice_ == INVALID_HANDLE_VALUE) return;
-        if (!applied_ && !ownExeAddedToWhitelist_) return;
+        if (!applied_ && !ownExeAddedToWhitelist_ && addedToBlacklist_.empty()) {
+            CloseHandle(hDevice_);
+            hDevice_ = INVALID_HANDLE_VALUE;
+            return;
+        }
 
         // Remove entries we added to the blacklist.
         if (!addedToBlacklist_.empty()) {
-            auto bl = GetBlacklist();
-            for (const auto& path : addedToBlacklist_) {
-                bl.erase(std::remove(bl.begin(), bl.end(), path), bl.end());
+            bool blacklistRead = false;
+            auto bl = GetBlacklist(&blacklistRead);
+            if (blacklistRead) {
+                for (const auto& path : addedToBlacklist_) {
+                    bl.erase(std::remove(bl.begin(), bl.end(), path), bl.end());
+                }
+                if (SetBlacklist(bl)) addedToBlacklist_.clear();
             }
-            SetBlacklist(bl);
-            addedToBlacklist_.clear();
         }
 
         // Remove this exe from the whitelist if we added it.
         if (ownExeAddedToWhitelist_) {
             std::wstring exePath = GetOwnExePath();
-            auto wl = GetWhitelist();
-            wl.erase(std::remove(wl.begin(), wl.end(), exePath), wl.end());
-            SetWhitelist(wl);
-            ownExeAddedToWhitelist_ = false;
+            bool whitelistRead = false;
+            auto wl = GetWhitelist(&whitelistRead);
+            if (whitelistRead) {
+                wl.erase(std::remove(wl.begin(), wl.end(), exePath), wl.end());
+                if (SetWhitelist(wl)) ownExeAddedToWhitelist_ = false;
+            }
         }
 
         // Restore the active flag to whatever it was before.
@@ -262,16 +288,20 @@ public:
     int Refresh() {
         if (!applied_) return 0;
 
-        auto bl = GetBlacklist();
-        int added = 0;
+        bool blacklistRead = false;
+        auto bl = GetBlacklist(&blacklistRead);
+        if (!blacklistRead) return 0;
+
+        std::vector<std::wstring> newlyAdded;
         for (const auto& path : EnumerateHidGameControllers()) {
             if (std::find(bl.begin(), bl.end(), path) != bl.end()) continue;
             bl.push_back(path);
-            addedToBlacklist_.push_back(path);
-            ++added;
+            newlyAdded.push_back(path);
         }
-        if (added != 0) SetBlacklist(bl);
-        return added;
+        if (newlyAdded.empty() || !SetBlacklist(bl)) return 0;
+        addedToBlacklist_.insert(
+            addedToBlacklist_.end(), newlyAdded.begin(), newlyAdded.end());
+        return static_cast<int>(newlyAdded.size());
     }
 
 private:
@@ -307,7 +337,8 @@ private:
     }
 
     // ── IOCTL helpers ──────────────────────────────────────────────────────
-    std::vector<BYTE> IoctlGet(DWORD code) {
+    std::vector<BYTE> IoctlGet(DWORD code, bool* success = nullptr) {
+        if (success) *success = false;
         // First call with a tiny buffer to learn the required size.
         std::vector<BYTE> buf(4096);
         DWORD returned = 0;
@@ -318,6 +349,7 @@ private:
                 &returned, nullptr);
             if (ok) {
                 buf.resize(returned);
+                if (success) *success = true;
                 return buf;
             }
             if (GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
@@ -328,41 +360,41 @@ private:
         }
     }
 
-    void IoctlSet(DWORD code, const std::vector<BYTE>& data) {
+    bool IoctlSet(DWORD code, const std::vector<BYTE>& data) {
         DWORD returned = 0;
-        DeviceIoControl(hDevice_, code,
+        return DeviceIoControl(hDevice_, code,
             const_cast<BYTE*>(data.data()), static_cast<DWORD>(data.size()),
             nullptr, 0,
-            &returned, nullptr);
+            &returned, nullptr) == TRUE;
     }
 
     // ── Active flag ────────────────────────────────────────────────────────
-    bool GetActive() {
-        auto buf = IoctlGet(IOCTL_HIDHIDE_GET_ACTIVE);
+    bool GetActive(bool* success = nullptr) {
+        auto buf = IoctlGet(IOCTL_HIDHIDE_GET_ACTIVE, success);
         return !buf.empty() && buf[0] != 0;
     }
 
-    void SetActive(bool enable) {
+    bool SetActive(bool enable) {
         std::vector<BYTE> buf = { enable ? (BYTE)1 : (BYTE)0 };
-        IoctlSet(IOCTL_HIDHIDE_SET_ACTIVE, buf);
+        return IoctlSet(IOCTL_HIDHIDE_SET_ACTIVE, buf);
     }
 
     // ── Whitelist ──────────────────────────────────────────────────────────
-    std::vector<std::wstring> GetWhitelist() {
-        return ParseMultiSz(IoctlGet(IOCTL_HIDHIDE_GET_WHITELIST));
+    std::vector<std::wstring> GetWhitelist(bool* success = nullptr) {
+        return ParseMultiSz(IoctlGet(IOCTL_HIDHIDE_GET_WHITELIST, success));
     }
 
-    void SetWhitelist(const std::vector<std::wstring>& v) {
-        IoctlSet(IOCTL_HIDHIDE_SET_WHITELIST, SerializeMultiSz(v));
+    bool SetWhitelist(const std::vector<std::wstring>& v) {
+        return IoctlSet(IOCTL_HIDHIDE_SET_WHITELIST, SerializeMultiSz(v));
     }
 
     // ── Blacklist (cloaked device instance paths) ──────────────────────────
-    std::vector<std::wstring> GetBlacklist() {
-        return ParseMultiSz(IoctlGet(IOCTL_HIDHIDE_GET_BLACKLIST));
+    std::vector<std::wstring> GetBlacklist(bool* success = nullptr) {
+        return ParseMultiSz(IoctlGet(IOCTL_HIDHIDE_GET_BLACKLIST, success));
     }
 
-    void SetBlacklist(const std::vector<std::wstring>& v) {
-        IoctlSet(IOCTL_HIDHIDE_SET_BLACKLIST, SerializeMultiSz(v));
+    bool SetBlacklist(const std::vector<std::wstring>& v) {
+        return IoctlSet(IOCTL_HIDHIDE_SET_BLACKLIST, SerializeMultiSz(v));
     }
 
     // ── Own executable path ────────────────────────────────────────────────
@@ -392,11 +424,9 @@ private:
     // enumeration level — the filter only blocks CreateFile from unauthorised
     // processes.  Because HidHide itself hasn't started cloaking yet when
     // Apply() calls us, and because this process will be whitelisted before
-    // we reach this point, we should be able to open them normally.  But to
-    // be safe we also fall back to opening read-only, and we emit the
-    // instance path even for devices we couldn't open, as long as the HID
-    // symbolic-link path contains "VID_" (a reliable sign of a real HID
-    // device interface, not a system pseudo-device).
+    // we reach this point, we should be able to query their HID caps. Devices
+    // whose caps cannot be confirmed are skipped; VID/PID alone is not enough
+    // because keyboards and mice use the same path format.
     static std::vector<std::wstring> EnumerateHidGameControllers() {
         std::vector<std::wstring> out;
 
@@ -463,21 +493,6 @@ private:
                     HidD_FreePreparsedData(ppd);
                 }
                 CloseHandle(hDev);
-            } else {
-                // Could not open the device (e.g. it's hidden by HidHide
-                // and we haven't been whitelisted yet for this path).
-                // Fall back: any HID interface whose symbolic path contains
-                // "VID_" and "PID_" is very likely a real hardware controller.
-                // We add it to the blacklist speculatively; HidHide will
-                // silently ignore paths it doesn't recognise as a HID device.
-                std::wstring dp = detail->DevicePath;
-                auto toUpper = [](std::wstring s) {
-                    for (auto& c : s) c = towupper(c);
-                    return s;
-                };
-                std::wstring dpUp = toUpper(dp);
-                isGamepad = (dpUp.find(L"VID_") != std::wstring::npos &&
-                             dpUp.find(L"PID_") != std::wstring::npos);
             }
 
             if (!isGamepad) continue;
