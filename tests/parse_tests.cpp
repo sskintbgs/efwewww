@@ -110,6 +110,12 @@ int main() {
                  "own virtual pad is never accepted as the only input");
         check_eq(SelectPhysicalXInputSlot(2, 3, 0x02), XUSER_MAX_COUNT,
                  "disconnected preferred slot does not switch controllers");
+        check(IsVerifiedVirtualXInputSlot(1, 0x01, 0x03),
+              "newly connected slot verifies as own virtual target");
+        check(!IsVerifiedVirtualXInputSlot(0, 0x01, 0x03),
+              "pre-existing physical slot cannot verify as virtual");
+        check(!IsVerifiedVirtualXInputSlot(2, 0x01, 0x03),
+              "disconnected slot cannot verify as virtual");
     }
 
     std::printf("\n== ViGEm device ancestry detection ==\n");
