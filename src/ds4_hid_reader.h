@@ -132,6 +132,41 @@ static inline int16_t HidLogicalToXInput(LONG value, LONG logMin, LONG logMax) {
     return static_cast<int16_t>(scaled - 32768);
 }
 
+// HIDP_VALUE_CAPS uses one of two union members depending on IsRange.  Axis
+// descriptors commonly group X/Y/Z/Rx/Ry/Rz into a range; ignoring ranged caps
+// loses their real logical bounds and makes otherwise valid sticks clamp.
+static inline bool HidValueCapsContainsUsage(const HIDP_VALUE_CAPS& caps,
+                                             USAGE page, USAGE usage) {
+    if (caps.UsagePage != page) return false;
+    if (caps.IsRange) {
+        return usage >= caps.Range.UsageMin && usage <= caps.Range.UsageMax;
+    }
+    return caps.NotRange.Usage == usage;
+}
+
+// Convert a descriptor-defined hat value to XInput D-pad bits.  HID hats can
+// be zero-based (0..7, null=8) or one-based (1..8, null=0), so the raw value
+// must be normalised by LogicalMin before applying the direction mapping.
+static inline uint16_t HidHatToXInputButtons(ULONG rawValue,
+                                             LONG logicalMin,
+                                             LONG logicalMax) {
+    const int64_t value = static_cast<int64_t>(rawValue);
+    if (logicalMax < logicalMin || value < logicalMin || value > logicalMax)
+        return 0;
+
+    const int direction = static_cast<int>(value - logicalMin);
+    uint16_t buttons = 0;
+    if (direction == 0 || direction == 1 || direction == 7)
+        buttons |= XUSB_GAMEPAD_DPAD_UP;
+    if (direction == 1 || direction == 2 || direction == 3)
+        buttons |= XUSB_GAMEPAD_DPAD_RIGHT;
+    if (direction == 3 || direction == 4 || direction == 5)
+        buttons |= XUSB_GAMEPAD_DPAD_DOWN;
+    if (direction == 5 || direction == 6 || direction == 7)
+        buttons |= XUSB_GAMEPAD_DPAD_LEFT;
+    return buttons;
+}
+
 // ── Candidate device info collected during enumeration ───────────────────────
 struct HidGamepadCandidate {
     std::wstring   devicePath;
@@ -205,6 +240,11 @@ public:
         sonyType_   = chosen->sonyType;
         deviceName_ = chosen->friendlyName;
         hEvent_     = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!hEvent_) {
+            Close();
+            return false;
+        }
+        readOv_.hEvent = hEvent_;
 
         // Cache the preparsed data (and value caps) for generic HID parsing so
         // the hot Read() path never has to re-query them.
@@ -232,7 +272,15 @@ public:
             ppd_ = nullptr;
         }
         if (hDev_ != INVALID_HANDLE_VALUE) {
-            CancelIo(hDev_);
+            if (readPending_) {
+                // Cancellation is asynchronous.  The OVERLAPPED structure and
+                // destination buffer are members specifically so they remain
+                // alive until the request has actually completed.
+                CancelIoEx(hDev_, &readOv_);
+                DWORD ignored = 0;
+                GetOverlappedResult(hDev_, &readOv_, &ignored, TRUE);
+                readPending_ = false;
+            }
             CloseHandle(hDev_);
             hDev_ = INVALID_HANDLE_VALUE;
         }
@@ -245,48 +293,60 @@ public:
         sonyType_   = SonyDeviceType::DS4;
         ZeroMemory(&hidCaps_, sizeof(hidCaps_));
         valueCaps_.clear();
+        ZeroMemory(&readOv_, sizeof(readOv_));
+        ZeroMemory(readBuf_, sizeof(readBuf_));
     }
 
-    // Non-blocking read: issues an overlapped ReadFile then waits up to
-    // timeoutMs milliseconds.  Returns true and fills state on success.
+    // Non-blocking read.  A timeout leaves the overlapped request pending so a
+    // later poll can collect it; cancelling and immediately discarding a
+    // stack-allocated OVERLAPPED/buffer races the HID driver and corrupts I/O.
     bool Read(PhysicalGamepadState& out, DWORD timeoutMs = 4) {
         if (!IsOpen()) return false;
 
-        uint8_t buf[256] = {};
-        OVERLAPPED ov    = {};
-        ov.hEvent        = hEvent_;
-        ResetEvent(hEvent_);
-
         DWORD bytesRead = 0;
-        BOOL  ok        = ReadFile(hDev_, buf, sizeof(buf), &bytesRead, &ov);
+        if (!readPending_) {
+            ZeroMemory(&readOv_, sizeof(readOv_));
+            readOv_.hEvent = hEvent_;
+            ResetEvent(hEvent_);
 
-        if (!ok) {
-            if (GetLastError() != ERROR_IO_PENDING) { Close(); return false; }
-            DWORD wait = WaitForSingleObject(hEvent_, timeoutMs);
-            if (wait != WAIT_OBJECT_0) {
-                CancelIo(hDev_);
-                return false;  // timeout — no new data yet
+            BOOL ok = ReadFile(hDev_, readBuf_, sizeof(readBuf_), &bytesRead, &readOv_);
+            if (!ok) {
+                if (GetLastError() != ERROR_IO_PENDING) {
+                    Close();
+                    return false;
+                }
+                readPending_ = true;
             }
-            if (!GetOverlappedResult(hDev_, &ov, &bytesRead, FALSE)) {
+        }
+
+        if (readPending_) {
+            DWORD wait = WaitForSingleObject(hEvent_, timeoutMs);
+            if (wait == WAIT_TIMEOUT) {
+                return false;  // no packet yet; retain the request for next poll
+            }
+            if (wait != WAIT_OBJECT_0 ||
+                !GetOverlappedResult(hDev_, &readOv_, &bytesRead, FALSE)) {
+                readPending_ = false;
                 Close();
                 return false;
             }
+            readPending_ = false;
         }
 
         if (bytesRead == 0) return false;
 
         if (isSony_) {
             SonyReportOffsets off;
-            if (!GetSonyOffsets(sonyType_, buf, bytesRead, off)) {
+            if (!GetSonyOffsets(sonyType_, readBuf_, bytesRead, off)) {
                 // Unrecognised or too-short report (e.g. a DualSense Bluetooth
                 // "minimal" report before full mode is enabled).  Skip silently
                 // so a single odd packet doesn't tear down the device handle.
                 return false;
             }
-            return ParseSonyReport(buf, off, out);
+            return ParseSonyReport(readBuf_, off, out);
         } else {
             // Generic HID gamepad: use HID parser API.
-            return ParseGeneric(buf, bytesRead, out);
+            return ParseGeneric(readBuf_, bytesRead, out);
         }
     }
 
@@ -394,6 +454,9 @@ private:
     // Value caps cached at Open() so the generic-parse hot path never re-queries
     // them (HidP_GetValueCaps + a heap allocation on every poll otherwise).
     std::vector<HIDP_VALUE_CAPS> valueCaps_;
+    uint8_t              readBuf_[256] = {};
+    OVERLAPPED           readOv_       = {};
+    bool                 readPending_  = false;
 
     // ── Enumerate all HID gamepads/joysticks currently attached ──────────────
     // Uses HID usage page / usage to identify game controllers regardless of
@@ -568,7 +631,7 @@ private:
             // hot path does no per-poll re-query or heap allocation.
             LONG logMin = 0, logMax = 255;
             for (const auto& vc : valueCaps_) {
-                if (!vc.IsRange && vc.UsagePage == 0x01 && vc.NotRange.Usage == am.usage) {
+                if (HidValueCapsContainsUsage(vc, 0x01, am.usage)) {
                     logMin = vc.LogicalMin;
                     logMax = vc.LogicalMax;
                     break;
@@ -613,15 +676,15 @@ private:
                 reinterpret_cast<PCHAR>(const_cast<uint8_t*>(buf)), len
             );
             if (st == HIDP_STATUS_SUCCESS) {
-                // Common hat values: 0=N 1=NE 2=E 3=SE 4=S 5=SW 6=W 7=NW; 8+ = centred.
-                bool du = (hat == 0 || hat == 1 || hat == 7);
-                bool dr = (hat == 1 || hat == 2 || hat == 3);
-                bool dd = (hat == 3 || hat == 4 || hat == 5);
-                bool dl = (hat == 5 || hat == 6 || hat == 7);
-                if (du) s.buttons |= XUSB_GAMEPAD_DPAD_UP;
-                if (dr) s.buttons |= XUSB_GAMEPAD_DPAD_RIGHT;
-                if (dd) s.buttons |= XUSB_GAMEPAD_DPAD_DOWN;
-                if (dl) s.buttons |= XUSB_GAMEPAD_DPAD_LEFT;
+                LONG logMin = 0, logMax = 7;
+                for (const auto& vc : valueCaps_) {
+                    if (HidValueCapsContainsUsage(vc, 0x01, 0x39)) {
+                        logMin = vc.LogicalMin;
+                        logMax = vc.LogicalMax;
+                        break;
+                    }
+                }
+                s.buttons |= HidHatToXInputButtons(hat, logMin, logMax);
             }
         }
 

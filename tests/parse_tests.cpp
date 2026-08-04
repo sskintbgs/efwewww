@@ -50,6 +50,47 @@ int main() {
     check_eq(ConvertAxis(32767),   255, "ConvertAxis(+max) = 255");
     check_eq(ConvertAxis(-32768),  0,   "ConvertAxis(-max) = 0");
 
+    std::printf("\n== Generic HID descriptor helpers ==\n");
+    {
+        HIDP_VALUE_CAPS ranged = {};
+        ranged.UsagePage = 0x01;
+        ranged.IsRange = TRUE;
+        ranged.Range.UsageMin = 0x30;
+        ranged.Range.UsageMax = 0x35;
+        check(HidValueCapsContainsUsage(ranged, 0x01, 0x30),
+              "ranged value cap contains first axis usage");
+        check(HidValueCapsContainsUsage(ranged, 0x01, 0x34),
+              "ranged value cap contains interior axis usage");
+        check(!HidValueCapsContainsUsage(ranged, 0x01, 0x39),
+              "ranged value cap rejects unrelated hat usage");
+
+        HIDP_VALUE_CAPS single = {};
+        single.UsagePage = 0x01;
+        single.IsRange = FALSE;
+        single.NotRange.Usage = 0x39;
+        check(HidValueCapsContainsUsage(single, 0x01, 0x39),
+              "single value cap contains exact usage");
+    }
+
+    std::printf("\n== Generic HID hat normalization ==\n");
+    {
+        // Many descriptors encode directions as 1..8 and use 0 as the null
+        // (centred) value. Treating the raw value as a zero-based direction
+        // turns that centred 0 into a permanently pressed D-pad Up.
+        check_eq(HidHatToXInputButtons(0, 1, 8), 0,
+                 "1-based hat null value 0 -> centred");
+        check_eq(HidHatToXInputButtons(1, 1, 8), XUSB_GAMEPAD_DPAD_UP,
+                 "1-based hat value 1 -> up");
+        check_eq(HidHatToXInputButtons(2, 1, 8),
+                 XUSB_GAMEPAD_DPAD_UP | XUSB_GAMEPAD_DPAD_RIGHT,
+                 "1-based hat value 2 -> up-right");
+        check_eq(HidHatToXInputButtons(8, 1, 8),
+                 XUSB_GAMEPAD_DPAD_UP | XUSB_GAMEPAD_DPAD_LEFT,
+                 "1-based hat value 8 -> up-left");
+        check_eq(HidHatToXInputButtons(8, 0, 7), 0,
+                 "zero-based hat out-of-range null value 8 -> centred");
+    }
+
     std::printf("\n== DS4 USB report parse ==\n");
     {
         uint8_t b[64] = {0};
