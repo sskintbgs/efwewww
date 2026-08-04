@@ -269,8 +269,8 @@ private:
             }
             if (hasPacket) neutralPending = false;
 
-            auto now = std::chrono::steady_clock::now();
-            if (neutralPending && now >= nextNeutralRetry) {
+            auto neutralNow = std::chrono::steady_clock::now();
+            if (neutralPending && neutralNow >= nextNeutralRetry) {
                 // ViGEm retains the last report indefinitely. Retry a neutral
                 // frame until it succeeds so inputs cannot remain held.
                 if (isDS4) {
@@ -285,7 +285,7 @@ private:
                     neutralPending = false;
                 } else {
                     ++fails;
-                    nextNeutralRetry = now + std::chrono::milliseconds(50);
+                    nextNeutralRetry = neutralNow + std::chrono::milliseconds(50);
                 }
             }
             wasConnected = sourceConnected;
