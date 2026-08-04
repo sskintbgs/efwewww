@@ -104,8 +104,8 @@ int main() {
     {
         check_eq(SelectPhysicalXInputSlot(0, 1, 0x03), 0,
                  "preferred physical slot remains selected");
-        check_eq(SelectPhysicalXInputSlot(0, 0, 0x03), 1,
-                 "own virtual slot is skipped");
+        check_eq(SelectPhysicalXInputSlot(0, 0, 0x03), XUSER_MAX_COUNT,
+                 "own virtual slot is rejected without switching controllers");
         check_eq(SelectPhysicalXInputSlot(0, 0, 0x01), XUSER_MAX_COUNT,
                  "own virtual pad is never accepted as the only input");
         check_eq(SelectPhysicalXInputSlot(2, 3, 0x02), XUSER_MAX_COUNT,
